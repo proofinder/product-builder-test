@@ -13,7 +13,7 @@
 
 | 사양 | 구현 위치 |
 |---|---|
-| 1. 얼굴 검출 및 tracking (rotation 포함) | `App/RPPG/Capture/FaceTracker.swift` |
+| 1. 얼굴 검출 및 tracking (rotation 포함) | `App/RPPG/Capture/FaceTracker.swift` + `Sources/RPPGCore/SimilarityTransform.swift` |
 | 1. frame rate / tracking rate 이원화 | `App/RPPG/Capture/CaptureCoordinator.swift` |
 | 1. 코너 4개 좌표 평균 y = 호흡 신호 | `FaceQuad.meanCornerY` → `RespirationPipeline` |
 | 2. 얼굴 중앙 80% ROI | `FaceQuad.scaled(_:)` → `ROISampler` |
@@ -59,23 +59,61 @@ Sources/RPPGCore/                 순수 Swift, 플랫폼 비의존 — 기기 �
   SignalRecord.swift              프레임별 CSV 스키마 + 파서 (17자리 무손실)
   PulsePipeline.swift             rppg(원본) / analysis(band-pass 사본) 분리, 호흡 체인
   RPPGEngine.swift                이원화된 두 진입점
-  Biquad / FFT / SpectralRateEstimator / RingBuffer / FaceGeometry / ROISample
+  SimilarityTransform.swift       최소자승 similarity 피팅 (레퍼런스의 estgeotform2d 대응)
+  Biquad / FFT / SpectralRateEstimator / RingBuffer / FaceGeometry / ROISample / RunningStatistics
 
 Sources/rppg-replay/              오프라인 러너: CSV의 C만으로 POS 재계산 · MATLAB 대조
 
 App/RPPG/
   Capture/CameraSession.swift     노출·화이트밸런스·HDR 잠금, 프레임 간격 고정
-  Capture/FaceTracker.swift       Vision 검출(roll) + 객체 추적 fallback, 4 Hz
+  Capture/FaceTracker.swift       랜드마크 앵커 + similarity 변환, 객체 추적 fallback, 4 Hz
+  Capture/TrackingDiagnostics.swift  Stage 1/2 통과 기준 실측값
   Capture/ROISampler.swift        회전된 ROI 내부 픽셀 평균 → C
   Capture/CaptureCoordinator.swift  frame rate ↔ tracking rate 이원화, 녹화
   Capture/SignalRecorder.swift    프레임별 CSV 기록 + 내보내기
-  Views/                          프리뷰, ROI 오버레이, 파형, POS 중간값, 진단
+  Views/TrackingView.swift        Stage 1-2 검증 화면 (통과 기준 실시간 판정)
+  Views/SignalPanel.swift         Stage 3+ 화면 (POS 중간값, 심박·호흡)
+  Views/FaceOverlayView.swift     얼굴 quad + 코너 번호 + roll 축 오버레이
 
 matlab/rPPG_test.m                원본 레퍼런스 (수정 금지)
 matlab/pos_reference.m            133–170행만 CSV 입출력으로 감싼 것
 tools/gen_golden.py               합성 C + 골든 POS 출력 생성
 Tests/RPPGCoreTests/Fixtures/     synthetic_C.csv, golden_pos.csv
 ```
+
+---
+
+## 얼굴 검출 / 트래킹 (Stage 1–2)
+
+레퍼런스는 얼굴 박스를 직접 추적하지 않습니다. 검출 → 박스 안 특징점 → KLT 추적 →
+**similarity 변환**을 코너 4개에 적용, 이 순서입니다. 코너가 서브픽셀로 매끄럽게 움직이고,
+그 매끄러움이 곧 호흡 신호의 품질입니다.
+
+iOS에 KLT는 없지만 Vision 랜드마크가 매 프레임 대응이 잡힌 조밀한 점 집합을 줍니다:
+
+1. **앵커** — 첫 검출 때 랜드마크 `P0`과 박스 `B0` 저장
+2. **추적** — 매 tick `P0 → Pk` similarity를 최소자승 피팅해 `T(B0)`를 현재 quad로
+3. **fallback** — 랜드마크 실패 시 `VNTrackObjectRequest`로 최대 8 tick
+
+레퍼런스와 의도적으로 다른 점: **이전 프레임이 아니라 최초 앵커에 대해** 피팅합니다.
+프레임마다 변환을 누적하면 드리프트가 쌓이는데, 코너 y의 느린 드리프트는 호흡과 구분되지
+않습니다. 눈·눈썹·코·정중선만 쓰고 입과 얼굴 외곽선은 제외합니다(비강체이거나 yaw에 따라
+머리 위를 미끄러짐).
+
+피팅은 유닛 테스트로 고정되어 있습니다 — 알려진 변환을 1e-10으로 복원, 이상치 배제,
+랜드마크 잡음을 코너 위치에서 **3배 이상 감소**(1.84 px → 0.57 px).
+
+### 앱에서 확인하는 법
+
+**Tracking 패널**에 Stage 1·2 통과 기준이 실시간 수치와 ✓/✗로 표시됩니다.
+
+1. 태블릿을 보고 앉아 **Reset stats**
+2. 1분 정지 → 프레임 지터·드롭·코너 지터·유실 횟수가 채워짐
+3. 머리 ±30° 기울이기 → 위쪽 변과 roll 축(점선)이 눈 라인과 평행한지 **눈으로**
+4. 고개 돌렸다 돌아오기 → 재획득 tick 수
+
+같은 화면에 **원시 mean corner y 파형**이 있습니다. 호흡은 1–2 px의 느린 파동으로 보여야 하고,
+그보다 빠른 성분은 트래커 노이즈입니다.
 
 ---
 
@@ -163,8 +201,7 @@ swift run rppg-replay Tests/RPPGCoreTests/Fixtures/synthetic_C.csv --compare <ma
 - Vision의 `roll` 부호는 y-down 픽셀 좌표계에 맞추어 뒤집었습니다
   (`FaceTracker.imageRoll(of:)`). ROI 오버레이가 머리 기울기와 반대로 돌면 그 한 줄의 부호를
   바꾸면 됩니다. Stage 2에서 가장 먼저 확인할 지점입니다.
-- **트래킹 방식이 레퍼런스와 다릅니다.** MATLAB은 KLT 특징점 추적 + similarity 변환으로
-  코너를 서브픽셀로 움직이는데, 현재는 Vision의 얼굴 bbox를 씁니다. Stage 2에서 랜드마크 기반
-  similarity 피팅으로 교체할 것을 제안합니다 (`docs/PLAN.md` 5절).
+- 트래킹은 레퍼런스 구조(특징점 → similarity 변환 → 코너)를 따르되 KLT 대신 Vision 랜드마크를
+  쓰고, 이전 프레임이 아니라 **최초 앵커**에 대해 피팅합니다. 차이는 `docs/PLAN.md` 5절 참고.
 - 화면 회전 대응은 없습니다. landscape 고정 전제입니다.
 - **의료기기가 아닙니다.** 진단 목적으로 사용하지 마세요.

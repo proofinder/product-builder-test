@@ -3,6 +3,14 @@ import RPPGCore
 import SwiftUI
 import UIKit
 
+/// Which stage the right-hand panel is showing.
+enum PanelMode: String, CaseIterable, Identifiable {
+    case tracking = "Tracking"
+    case signal = "Signal"
+
+    var id: String { rawValue }
+}
+
 /// Which trace the debug plot shows. Every POS intermediate is selectable, because
 /// stage-by-stage verification means being able to look at each one on its own.
 enum DebugSignal: String, CaseIterable, Identifiable {
@@ -23,6 +31,8 @@ final class RPPGViewModel: ObservableObject {
     @Published var errorMessage: String?
 
     @Published var showsROIOverlay = true
+    @Published var showsCornerMarkers = true
+    @Published var panel: PanelMode = .tracking
     @Published var debugSignal: DebugSignal = .rppgFiltered
 
     @Published var skinGateEnabled = false {
@@ -87,6 +97,11 @@ final class RPPGViewModel: ObservableObject {
         coordinator.rebalanceCamera()
     }
 
+    /// Clears the Stage 1 / Stage 2 measurement window.
+    func resetStatistics() {
+        coordinator.resetStatistics()
+    }
+
     // MARK: - Recording
 
     func toggleRecording() {
@@ -130,16 +145,29 @@ final class RPPGViewModel: ObservableObject {
 
     var statusText: String {
         if let errorMessage { return errorMessage }
-        if !isRunning { return "Tap Start to begin measuring." }
-        if !snapshot.quality.faceTracked { return "Looking for a face — sit facing the tablet." }
-        if snapshot.quality.clippedFraction > 0.15 { return "Too bright: the skin is over-exposed." }
-        if snapshot.quality.roiPixelCount < 500 { return "Move closer to the tablet." }
-        if snapshot.quality.secondsBuffered < 6 {
-            return String(format: "Acquiring signal… %.0f s", snapshot.quality.secondsBuffered)
+        if !isRunning { return "Tap Start camera." }
+        if !snapshot.tracking.faceTracked { return "Looking for a face — sit facing the tablet." }
+
+        switch panel {
+        case .tracking:
+            let tracking = snapshot.tracking
+            if tracking.source == FaceTracker.Source.objectTracking.rawValue {
+                return "Landmarks lost — carrying the box on the object tracker."
+            }
+            return String(
+                format: "Tracking: %d landmarks, %d inliers, residual %.2f px",
+                tracking.landmarkCount, tracking.inlierCount, tracking.rmsResidualPx
+            )
+        case .signal:
+            if snapshot.quality.clippedFraction > 0.15 { return "Too bright: the skin is over-exposed." }
+            if snapshot.quality.roiPixelCount < 500 { return "Move closer to the tablet." }
+            if snapshot.quality.secondsBuffered < 6 {
+                return String(format: "Acquiring signal… %.0f s", snapshot.quality.secondsBuffered)
+            }
+            if let snr = snapshot.heartRate?.signalToNoiseDB, snr < 0 {
+                return "Weak signal — hold still and avoid backlight."
+            }
+            return "Measuring."
         }
-        if let snr = snapshot.heartRate?.signalToNoiseDB, snr < 0 {
-            return "Weak signal — hold still and avoid backlight."
-        }
-        return "Measuring."
     }
 }

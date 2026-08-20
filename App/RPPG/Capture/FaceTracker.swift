@@ -4,149 +4,277 @@ import RPPGCore
 import Vision
 import os
 
-/// Detection + tracking of a single face, including in-plane rotation.
+/// Detection and tracking of a single face, including in-plane rotation.
 ///
-/// Runs at the **tracking rate** (4 Hz by default), not the frame rate. Each tick:
+/// ## Why it is built this way
 ///
-/// 1. the live `VNTrackObjectRequest` is advanced on the current frame, keeping it
-///    warm and giving a fallback box;
-/// 2. `VNDetectFaceRectanglesRequest` runs and, when it finds a face, wins — its
-///    observation carries `roll`, which the object tracker cannot provide, and it
-///    re-seeds the tracker so drift never accumulates;
-/// 3. if detection finds nothing (blink of occlusion, fast head turn) the tracker's
-///    box is used with the last known roll, for up to `maxTrackedTicks` ticks before
-///    the face is declared lost.
+/// The reference (`rPPG_test.m`) does not track the face box directly. It detects a
+/// face once, finds corner features inside it (`detectMinEigenFeatures`), tracks those
+/// points with KLT, fits a **similarity transform** between the old and new point sets
+/// (`estgeotform2d`), and applies that transform to the four box corners. The corners
+/// therefore move smoothly and at sub-pixel precision — which matters enormously,
+/// because the mean of their `y` coordinates *is* the respiration signal.
+///
+/// iOS has no KLT tracker exposed, but Vision's face landmarks give a dense,
+/// sub-pixel, already-corresponded point set every frame. So the same structure is
+/// used with landmarks in place of KLT points:
+///
+/// 1. **Anchor** — on first detection, store the landmark set `P0` and the box `B0`.
+/// 2. **Track** — each tick, fit a similarity transform `P0 → Pk` and report
+///    `T(B0)` as the current quad.
+/// 3. **Fall back** — if landmarks fail, carry the face on `VNTrackObjectRequest` for a
+///    few ticks before declaring it lost.
+///
+/// Fitting against the *original* anchor rather than the previous frame is a
+/// deliberate difference from the reference: `transformPointsForward` applied
+/// frame-to-frame accumulates drift, and a slow drift in the corner `y` is
+/// indistinguishable from a breath. Anchoring removes that failure mode entirely.
 ///
 /// Everything is expressed in **image pixel coordinates with y pointing down**, which
 /// is what ``FaceQuad`` and the ROI sampler expect.
 /// `@unchecked Sendable`: all state is confined to the caller's Vision queue.
 final class FaceTracker: @unchecked Sendable {
 
-    struct Output: Sendable {
+    // MARK: - Types
+
+    enum Source: String {
+        /// A fresh anchor was taken this tick (first detection, or a re-anchor).
+        case anchor
+        /// The quad came from a similarity fit against the anchor.
+        case similarity
+        /// Landmarks failed; the box came from the object tracker.
+        case objectTracking
+    }
+
+    struct Output {
         /// The tracked face region. Its four corners are the respiration signal source.
         let faceQuad: FaceQuad
         /// In-plane rotation, radians, positive clockwise on screen.
         let roll: Double
+        /// Scale relative to the anchor — 1.0 at the moment of anchoring.
+        let scale: Double
         let confidence: Double
         let source: Source
+        /// Landmarks fed to the fit.
+        let landmarkCount: Int
+        /// Landmarks that survived outlier rejection.
+        let inlierCount: Int
+        /// RMS fit residual in pixels; `nan` when no fit ran.
+        let rmsResidual: Double
+        /// How many times the anchor has been retaken this session.
+        let anchorCount: Int
         let imageSize: CGSize
     }
 
-    enum Source {
-        case detection
-        case tracking
+    struct Configuration {
+        /// Landmark regions used for the fit.
+        ///
+        /// Mouth and outer face contour are excluded on purpose: the mouth is not
+        /// rigid (talking, expression) and the contour slides across the head as the
+        /// subject turns, so both would inject motion that is not head motion.
+        var regions: Set<LandmarkRegion> = [
+            .leftEye, .rightEye, .leftEyebrow, .rightEyebrow, .nose, .noseCrest, .medianLine
+        ]
+        /// `estgeotform2d`'s MaxDistance, in pixels.
+        var maxCorrespondenceDistance: Double = 4
+        /// Re-anchor when the RMS residual exceeds this fraction of the face width.
+        /// Large out-of-plane rotation breaks the rigid assumption; re-anchoring
+        /// recovers, at the cost of a small step in the corner positions.
+        var reanchorResidualFraction: Double = 0.06
+        /// How many consecutive ticks the object tracker may carry the face alone.
+        var maxTrackedTicks: Int = 8
+        var minimumTrackingConfidence: Float = 0.35
+        var minimumDetectionConfidence: Float = 0.4
+        /// Fewest landmarks that can support a fit.
+        var minimumLandmarks: Int = 8
     }
 
-    struct Configuration {
-        /// How many consecutive ticks the object tracker may carry the face on its own
-        /// before it is declared lost.
-        var maxTrackedTicks: Int = 8
-        /// Below this, a `VNDetectedObjectObservation` is not trusted.
-        var minimumTrackingConfidence: Float = 0.35
-        /// Below this, a `VNFaceObservation` is ignored.
-        var minimumDetectionConfidence: Float = 0.4
-        /// EWMA time constant for the roll angle, in *tracking ticks*, to keep the ROI
-        /// from twitching on noisy per-frame roll estimates.
-        var rollSmoothingTicks: Double = 2.0
+    enum LandmarkRegion: CaseIterable, Hashable {
+        case leftEye, rightEye, leftEyebrow, rightEyebrow, nose, noseCrest, medianLine
+        case outerLips, faceContour
     }
+
+    // MARK: - State
 
     private let configuration: Configuration
     private let sequenceHandler = VNSequenceRequestHandler()
     private var trackingRequest: VNTrackObjectRequest?
-    private var ticksSinceDetection = 0
-    private var rollFilter: EWMA
+
+    /// The anchor: landmark positions and the face box at the moment it was taken.
+    private var anchorLandmarks: [Point2D] = []
+    private var anchorQuad: FaceQuad?
+    private var anchorCount = 0
+
+    private var ticksSinceLandmarks = 0
     private var lastRoll: Double = 0
+    private var lastScale: Double = 1
+
     private let logger = Logger(subsystem: "com.rppg.tablet", category: "FaceTracker")
 
     init(configuration: Configuration = Configuration()) {
         self.configuration = configuration
-        // The roll filter ticks once per tracking update, so its "sample rate" is 1.
-        rollFilter = EWMA(timeConstant: configuration.rollSmoothingTicks, sampleRate: 1)
     }
 
+    // MARK: - Tracking
+
     /// One tracking tick. Call from a dedicated Vision queue — it is CPU/ANE bound and
-    /// must not sit on the frame-rate path.
+    /// must never sit on the frame-rate path.
     ///
     /// - Returns: `nil` when the face is lost.
     func track(pixelBuffer: CVPixelBuffer) -> Output? {
-        let width = CVPixelBufferGetWidth(pixelBuffer)
-        let height = CVPixelBufferGetHeight(pixelBuffer)
-        let imageSize = CGSize(width: width, height: height)
+        let imageSize = CGSize(
+            width: CVPixelBufferGetWidth(pixelBuffer),
+            height: CVPixelBufferGetHeight(pixelBuffer)
+        )
 
-        // 1. Advance the existing tracker, if any.
-        var trackedObservation: VNDetectedObjectObservation?
-        if let request = trackingRequest {
-            do {
-                // `.up` is correct because the capture connection already rotated and
-                // mirrored the buffer into display orientation.
-                try sequenceHandler.perform([request], on: pixelBuffer, orientation: .up)
-                if let result = request.results?.first as? VNDetectedObjectObservation,
-                   result.confidence >= configuration.minimumTrackingConfidence {
-                    trackedObservation = result
-                    request.inputObservation = result
-                } else {
-                    trackingRequest = nil
+        // 1. Keep the object tracker warm; it is the fallback when landmarks fail.
+        let trackedObservation = advanceObjectTracker(pixelBuffer: pixelBuffer)
+
+        // 2. Landmarks — the primary path.
+        if let face = detectFaceWithLandmarks(in: pixelBuffer) {
+            ticksSinceLandmarks = 0
+            seedObjectTracker(with: face.boundingBox)
+
+            let landmarks = landmarkPoints(of: face, imageSize: imageSize)
+            if landmarks.count >= configuration.minimumLandmarks {
+                if let output = trackAgainstAnchor(
+                    landmarks: landmarks,
+                    face: face,
+                    imageSize: imageSize
+                ) {
+                    return output
                 }
-            } catch {
-                logger.debug("object tracking failed: \(error.localizedDescription, privacy: .public)")
-                trackingRequest = nil
+                return takeAnchor(
+                    landmarks: landmarks,
+                    face: face,
+                    imageSize: imageSize,
+                    reason: "fit failed"
+                )
             }
         }
 
-        // 2. Detection, which owns the roll angle.
-        if let face = detectFace(in: pixelBuffer) {
-            ticksSinceDetection = 0
-            let request = VNTrackObjectRequest(detectedObjectObservation:
-                VNDetectedObjectObservation(boundingBox: face.boundingBox))
-            request.trackingLevel = .accurate
-            trackingRequest = request
-
-            let roll = rollFilter.update(imageRoll(of: face))
-            lastRoll = roll
-            return Output(
-                faceQuad: quad(from: face.boundingBox, roll: roll, imageSize: imageSize),
-                roll: roll,
-                confidence: Double(face.confidence),
-                source: .detection,
-                imageSize: imageSize
-            )
-        }
-
-        // 3. Fall back to the tracker.
-        ticksSinceDetection += 1
-        guard let trackedObservation, ticksSinceDetection <= configuration.maxTrackedTicks else {
+        // 3. Fall back to the object tracker's box, carrying the last roll and scale.
+        ticksSinceLandmarks += 1
+        guard let trackedObservation, ticksSinceLandmarks <= configuration.maxTrackedTicks else {
             reset()
             return nil
         }
         return Output(
             faceQuad: quad(from: trackedObservation.boundingBox, roll: lastRoll, imageSize: imageSize),
             roll: lastRoll,
+            scale: lastScale,
             confidence: Double(trackedObservation.confidence),
-            source: .tracking,
+            source: .objectTracking,
+            landmarkCount: 0,
+            inlierCount: 0,
+            rmsResidual: .nan,
+            anchorCount: anchorCount,
             imageSize: imageSize
         )
     }
 
     func reset() {
         trackingRequest = nil
-        ticksSinceDetection = 0
-        rollFilter.reset()
+        anchorLandmarks = []
+        anchorQuad = nil
+        ticksSinceLandmarks = 0
         lastRoll = 0
+        lastScale = 1
+    }
+
+    // MARK: - Anchor and fit
+
+    private func trackAgainstAnchor(
+        landmarks: [Point2D],
+        face: VNFaceObservation,
+        imageSize: CGSize
+    ) -> Output? {
+        guard let anchorQuad, anchorLandmarks.count == landmarks.count else { return nil }
+
+        guard let fit = SimilarityTransformEstimator.fit(
+            from: anchorLandmarks,
+            to: landmarks,
+            maxDistance: configuration.maxCorrespondenceDistance
+        ) else { return nil }
+
+        let quad = fit.transform.apply(to: anchorQuad)
+
+        // The rigid assumption has broken down — usually a large yaw or pitch, where
+        // the landmark constellation itself deforms. Re-anchor rather than report a
+        // box that no longer matches the face.
+        let tolerance = configuration.reanchorResidualFraction * Swift.max(quad.width, 1)
+        if fit.rmsResidual > tolerance {
+            return takeAnchor(
+                landmarks: landmarks,
+                face: face,
+                imageSize: imageSize,
+                reason: String(format: "residual %.1f px > %.1f px", fit.rmsResidual, tolerance)
+            )
+        }
+
+        lastRoll = quad.roll
+        lastScale = fit.transform.scale
+
+        return Output(
+            faceQuad: quad,
+            roll: quad.roll,
+            scale: fit.transform.scale,
+            confidence: Double(face.confidence),
+            source: .similarity,
+            landmarkCount: landmarks.count,
+            inlierCount: fit.inlierCount,
+            rmsResidual: fit.rmsResidual,
+            anchorCount: anchorCount,
+            imageSize: imageSize
+        )
+    }
+
+    private func takeAnchor(
+        landmarks: [Point2D],
+        face: VNFaceObservation,
+        imageSize: CGSize,
+        reason: String
+    ) -> Output {
+        let roll = visionRoll(of: face)
+        let quad = self.quad(from: face.boundingBox, roll: roll, imageSize: imageSize)
+
+        anchorLandmarks = landmarks
+        anchorQuad = quad
+        anchorCount += 1
+        lastRoll = roll
+        lastScale = 1
+
+        logger.info("anchor #\(self.anchorCount) (\(reason, privacy: .public)), \(landmarks.count) landmarks")
+
+        return Output(
+            faceQuad: quad,
+            roll: roll,
+            scale: 1,
+            confidence: Double(face.confidence),
+            source: .anchor,
+            landmarkCount: landmarks.count,
+            inlierCount: landmarks.count,
+            rmsResidual: 0,
+            anchorCount: anchorCount,
+            imageSize: imageSize
+        )
     }
 
     // MARK: - Vision plumbing
 
-    private func detectFace(in pixelBuffer: CVPixelBuffer) -> VNFaceObservation? {
-        let request = VNDetectFaceRectanglesRequest()
-        // Revision 3 is the one that reports roll / yaw / pitch.
-        if VNDetectFaceRectanglesRequest.supportedRevisions.contains(VNDetectFaceRectanglesRequestRevision3) {
-            request.revision = VNDetectFaceRectanglesRequestRevision3
+    private func detectFaceWithLandmarks(in pixelBuffer: CVPixelBuffer) -> VNFaceObservation? {
+        let request = VNDetectFaceLandmarksRequest()
+        // Revision 3 reports roll / yaw / pitch and the 76-point constellation.
+        if VNDetectFaceLandmarksRequest.supportedRevisions.contains(VNDetectFaceLandmarksRequestRevision3) {
+            request.revision = VNDetectFaceLandmarksRequestRevision3
         }
+        // `.up` is correct because the capture connection already rotated and mirrored
+        // the buffer into display orientation.
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
         do {
             try handler.perform([request])
         } catch {
-            logger.debug("face detection failed: \(error.localizedDescription, privacy: .public)")
+            logger.debug("landmark detection failed: \(error.localizedDescription, privacy: .public)")
             return nil
         }
         guard let faces = request.results, !faces.isEmpty else { return nil }
@@ -158,25 +286,93 @@ final class FaceTracker: @unchecked Sendable {
             }
     }
 
+    private func advanceObjectTracker(pixelBuffer: CVPixelBuffer) -> VNDetectedObjectObservation? {
+        guard let request = trackingRequest else { return nil }
+        do {
+            try sequenceHandler.perform([request], on: pixelBuffer, orientation: .up)
+            guard let result = request.results?.first as? VNDetectedObjectObservation,
+                  result.confidence >= configuration.minimumTrackingConfidence else {
+                trackingRequest = nil
+                return nil
+            }
+            request.inputObservation = result
+            return result
+        } catch {
+            logger.debug("object tracking failed: \(error.localizedDescription, privacy: .public)")
+            trackingRequest = nil
+            return nil
+        }
+    }
+
+    private func seedObjectTracker(with boundingBox: CGRect) {
+        let request = VNTrackObjectRequest(
+            detectedObjectObservation: VNDetectedObjectObservation(boundingBox: boundingBox)
+        )
+        request.trackingLevel = .accurate
+        trackingRequest = request
+    }
+
+    /// Landmark points of the configured regions, in image pixel coordinates with the
+    /// origin top-left.
+    ///
+    /// The order is fixed by `LandmarkRegion.allCases`, so the anchor and the current
+    /// frame stay in correspondence index by index — which the similarity fit needs.
+    private func landmarkPoints(of face: VNFaceObservation, imageSize: CGSize) -> [Point2D] {
+        guard let landmarks = face.landmarks else { return [] }
+        var points: [Point2D] = []
+        points.reserveCapacity(80)
+
+        for region in LandmarkRegion.allCases where configuration.regions.contains(region) {
+            guard let landmarkRegion = self.region(region, of: landmarks) else { continue }
+            for point in landmarkRegion.pointsInImage(imageSize: imageSize) {
+                // Vision's image coordinates put the origin bottom-left.
+                points.append(Point2D(x: Double(point.x), y: Double(imageSize.height) - Double(point.y)))
+            }
+        }
+        return points
+    }
+
+    private func region(
+        _ region: LandmarkRegion,
+        of landmarks: VNFaceLandmarks2D
+    ) -> VNFaceLandmarkRegion2D? {
+        switch region {
+        case .leftEye: return landmarks.leftEye
+        case .rightEye: return landmarks.rightEye
+        case .leftEyebrow: return landmarks.leftEyebrow
+        case .rightEyebrow: return landmarks.rightEyebrow
+        case .nose: return landmarks.nose
+        case .noseCrest: return landmarks.noseCrest
+        case .medianLine: return landmarks.medianLine
+        case .outerLips: return landmarks.outerLips
+        case .faceContour: return landmarks.faceContour
+        }
+    }
+
     /// Vision reports roll counter-clockwise in its own y-up normalised space; the ROI
     /// sampler works in y-down pixel space, where the same rotation has the opposite
     /// sign.
-    private func imageRoll(of face: VNFaceObservation) -> Double {
+    ///
+    /// Only used when taking an anchor. After that the roll comes from the fitted
+    /// transform, which is measured in image coordinates already and needs no flip.
+    private func visionRoll(of face: VNFaceObservation) -> Double {
         guard let roll = face.roll else { return lastRoll }
         return -roll.doubleValue
     }
 
     /// Converts a Vision bounding box (normalised, origin bottom-left) into a rolled
     /// ``FaceQuad`` in pixel coordinates with the origin top-left.
+    ///
+    /// Corner order matches MATLAB's `bbox2points`: top-left, top-right, bottom-right,
+    /// bottom-left, in the face's own frame.
     private func quad(from boundingBox: CGRect, roll: Double, imageSize: CGSize) -> FaceQuad {
-        let width = boundingBox.width * imageSize.width
-        let height = boundingBox.height * imageSize.height
-        let centerX = boundingBox.midX * imageSize.width
-        let centerY = (1 - boundingBox.midY) * imageSize.height
-        return FaceQuad(
-            center: Point2D(x: centerX, y: centerY),
-            width: width,
-            height: height,
+        FaceQuad(
+            center: Point2D(
+                x: Double(boundingBox.midX) * Double(imageSize.width),
+                y: (1 - Double(boundingBox.midY)) * Double(imageSize.height)
+            ),
+            width: Double(boundingBox.width) * Double(imageSize.width),
+            height: Double(boundingBox.height) * Double(imageSize.height),
             roll: roll
         )
     }

@@ -1,0 +1,286 @@
+import RPPGCore
+import SwiftUI
+
+/// Stage 1 + Stage 2 verification screen: capture timing, face detection and tracking.
+///
+/// Everything on this screen exists to answer one question — *is the tracking good
+/// enough to build the rest on?* The overlay answers it visually, the criteria list
+/// answers it numerically, and the corner-y trace shows the signal that Stage 6 will
+/// eventually be made of.
+///
+/// Procedure:
+/// 1. Sit facing the tablet, tap **Reset stats**.
+/// 2. Hold still for a minute — the jitter and loss criteria fill in.
+/// 3. Tilt the head ±30° and watch the top edge stay parallel to the eye line.
+/// 4. Turn away and back; check the re-acquire figure.
+struct TrackingPanel: View {
+
+    @ObservedObject var viewModel: RPPGViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            stageOne
+            stageTwo
+            cornerTrace
+            liveValues
+            controls
+        }
+    }
+
+    // MARK: - Stage 1
+
+    private var stageOne: some View {
+        let tracking = viewModel.snapshot.tracking
+        let hasFrames = tracking.deliveredFrameCount > 30
+        let rateError = abs(tracking.measuredFrameRate - tracking.configuredFrameRate)
+
+        return PassCriterionList(
+            title: "Stage 1 — capture",
+            subtitle: "Measured over the window since the last reset.",
+            criteria: [
+                PassCriterion(
+                    "Frame rate",
+                    requirement: String(format: "within ±0.5 Hz of %.0f", tracking.configuredFrameRate),
+                    value: tracking.measuredFrameRate,
+                    format: "%.2f Hz",
+                    passes: rateError <= 0.5,
+                    ready: hasFrames
+                ),
+                PassCriterion(
+                    "Frame interval jitter",
+                    requirement: "std < 2 ms",
+                    value: tracking.frameIntervalJitterMs,
+                    format: "%.2f ms",
+                    passes: tracking.frameIntervalJitterMs < 2,
+                    ready: hasFrames
+                ),
+                PassCriterion(
+                    "Dropped frames",
+                    requirement: "< 0.5 %",
+                    measured: String(
+                        format: "%d  (%.2f %%)",
+                        tracking.droppedFrameCount,
+                        tracking.dropPercent
+                    ),
+                    verdict: hasFrames
+                        ? (tracking.dropPercent < 0.5 ? .pass : .fail)
+                        : .pending("measuring…")
+                ),
+                PassCriterion(
+                    "Tracking tick rate",
+                    requirement: String(
+                        format: "%.0f Hz ± 10 %% (250 ms ± 25 ms)",
+                        tracking.configuredTrackingRate
+                    ),
+                    value: tracking.measuredTrackingRate,
+                    format: "%.2f Hz",
+                    passes: abs(tracking.measuredTrackingRate - tracking.configuredTrackingRate)
+                        <= tracking.configuredTrackingRate * 0.1,
+                    ready: tracking.trackingTickCount > 20
+                ),
+                PassCriterion(
+                    "Exposure lock",
+                    requirement: "wave a hand: background brightness must not change",
+                    measured: "check by eye",
+                    verdict: .pending("manual")
+                )
+            ]
+        )
+    }
+
+    // MARK: - Stage 2
+
+    private var stageTwo: some View {
+        let tracking = viewModel.snapshot.tracking
+        // A minute of stillness at 4 Hz is 240 ticks; 15 s is enough to show a trend.
+        let enoughSamples = tracking.statsSampleCount >= 60
+        let jitterReady = enoughSamples && tracking.faceWidthPx > 0
+
+        return PassCriterionList(
+            title: "Stage 2 — detection & tracking",
+            subtitle: String(
+                format: "Window: %.0f s / %d ticks. Hold still after resetting.",
+                tracking.statsSeconds,
+                tracking.statsSampleCount
+            ),
+            criteria: [
+                PassCriterion(
+                    "Roll direction",
+                    requirement: "tilt ±30°: top edge stays parallel to the eye line",
+                    measured: String(format: "%+.1f°", tracking.rollDegrees),
+                    verdict: .pending("manual")
+                ),
+                PassCriterion(
+                    "Face lost while still",
+                    requirement: "0 events",
+                    measured: "\(tracking.faceLostCount)",
+                    verdict: enoughSamples
+                        ? (tracking.faceLostCount == 0 ? .pass : .fail)
+                        : .pending("measuring…")
+                ),
+                PassCriterion(
+                    "Corner jitter",
+                    requirement: "std < 0.5 % of face width",
+                    measured: String(
+                        format: "%.2f px  (%.3f %%)",
+                        tracking.cornerJitterPx,
+                        tracking.cornerJitterPercentOfWidth
+                    ),
+                    verdict: jitterReady
+                        ? (tracking.cornerJitterPercentOfWidth < 0.5 ? .pass : .fail)
+                        : .pending("measuring…")
+                ),
+                PassCriterion(
+                    "Re-acquire after looking away",
+                    requirement: "≤ 2 ticks (0.5 s)",
+                    measured: tracking.worstReacquireTicks > 0
+                        ? "worst \(tracking.worstReacquireTicks) ticks"
+                        : "no loss yet",
+                    verdict: tracking.worstReacquireTicks == 0
+                        ? .pending("turn away and back")
+                        : (tracking.worstReacquireTicks <= 2 ? .pass : .fail)
+                ),
+                PassCriterion(
+                    "Similarity fit residual",
+                    requirement: "< 3 % of face width while still",
+                    measured: residualText(tracking),
+                    verdict: residualVerdict(tracking, ready: enoughSamples)
+                )
+            ]
+        )
+    }
+
+    private func residualText(_ tracking: TrackingDiagnostics) -> String {
+        guard tracking.faceWidthPx > 0, tracking.residualRmsMeanPx > 0 else { return "—" }
+        return String(
+            format: "%.2f px  (%.2f %%)",
+            tracking.residualRmsMeanPx,
+            tracking.residualRmsMeanPx / tracking.faceWidthPx * 100
+        )
+    }
+
+    private func residualVerdict(
+        _ tracking: TrackingDiagnostics,
+        ready: Bool
+    ) -> PassCriterion.Verdict {
+        guard ready, tracking.faceWidthPx > 0, tracking.residualRmsMeanPx > 0 else {
+            return .pending("measuring…")
+        }
+        return tracking.residualRmsMeanPx / tracking.faceWidthPx * 100 < 3 ? .pass : .fail
+    }
+
+    // MARK: - Corner y trace
+
+    /// The respiration signal source, unfiltered. Breathing should be visible as a slow
+    /// wave of a pixel or two; anything faster is tracker noise.
+    private var cornerTrace: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Mean corner y (respiration source, raw)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text(String(format: "std %.2f px", viewModel.snapshot.tracking.meanCornerYStdPx))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            WaveformView(
+                samples: viewModel.snapshot.cornerYWaveform,
+                color: .cyan,
+                visibleSampleCount: 240
+            )
+            .frame(height: 110)
+            .background(Color.black.opacity(0.35), in: RoundedRectangle(cornerRadius: 10))
+            Text("60 s at the tracking rate, mean removed.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - Live values
+
+    private var liveValues: some View {
+        let tracking = viewModel.snapshot.tracking
+        let quad = viewModel.snapshot.faceQuad
+        return VStack(alignment: .leading, spacing: 6) {
+            Text("Tracker, this tick")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+            row("Source", tracking.source)
+            row("Landmarks / inliers", "\(tracking.landmarkCount) / \(tracking.inlierCount)")
+            row("Fit residual", tracking.rmsResidualPx.isFinite
+                ? String(format: "%.2f px", tracking.rmsResidualPx) : "—")
+            row("Scale vs anchor", String(format: "%.4f", tracking.scale))
+            row("Anchors taken", "\(tracking.anchorCount)")
+            row("Roll", String(format: "%+.2f°  (std %.2f°)", tracking.rollDegrees, tracking.rollStdDegrees))
+            row("Face box", String(format: "%.0f × %.0f px", tracking.faceWidthPx, tracking.faceHeightPx))
+            if let quad {
+                row("Mean corner y", String(format: "%.2f px", quad.meanCornerY))
+                ForEach(Array(quad.corners.enumerated()), id: \.offset) { index, corner in
+                    row("Corner \(index + 1)", String(format: "%.1f, %.1f", corner.x, corner.y))
+                }
+            }
+        }
+        .font(.caption.monospacedDigit())
+        .foregroundStyle(.secondary)
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+
+    private func row(_ label: String, _ value: String) -> some View {
+        HStack {
+            Text(label)
+            Spacer()
+            Text(value).foregroundStyle(.primary)
+        }
+    }
+
+    // MARK: - Controls
+
+    private var controls: some View {
+        VStack(spacing: 12) {
+            Button {
+                viewModel.resetStatistics()
+            } label: {
+                Label("Reset stats", systemImage: "gauge")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+
+            Button {
+                viewModel.toggleRecording()
+            } label: {
+                Label(
+                    viewModel.snapshot.isRecording ? "Stop recording" : "Record CSV",
+                    systemImage: viewModel.snapshot.isRecording ? "stop.circle" : "record.circle"
+                )
+                .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .tint(viewModel.snapshot.isRecording ? .red : .blue)
+            .disabled(!viewModel.isRunning)
+
+            if let url = viewModel.finishedRecording {
+                ShareLink(item: url) {
+                    Label("Export \(url.lastPathComponent)", systemImage: "square.and.arrow.up")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+            }
+
+            Toggle("Show corner numbers", isOn: $viewModel.showsCornerMarkers)
+            Toggle("Show ROI overlay", isOn: $viewModel.showsROIOverlay)
+
+            Button {
+                viewModel.rebalanceCamera()
+            } label: {
+                Label("Re-balance camera", systemImage: "sun.max")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+        }
+        .font(.callout)
+    }
+}

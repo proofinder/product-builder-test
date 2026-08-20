@@ -37,6 +37,11 @@ struct CaptureSnapshot: Sendable {
     var deliveredFrameCount: Int = 0
     var trackSource: String = "none"
 
+    /// Raw mean-corner-y at the tracking rate, mean removed for plotting. This is the
+    /// respiration signal before any filtering — what Stage 2 has to get right.
+    var cornerYWaveform: [Double] = []
+    var tracking = TrackingDiagnostics()
+
     var isRecording = false
     var recordedRowCount = 0
 }
@@ -109,8 +114,11 @@ final class CaptureCoordinator: @unchecked Sendable {
     private var lastPublishTimestamp: TimeInterval = -.infinity
     private var visionBusy = false
     private var previousFrameTimestamp: TimeInterval?
-    private var frameIntervalStats = IntervalStatistics()
-    private var trackIntervalStats = IntervalStatistics()
+    private var frameIntervalStats = RunningStatistics()
+    private var trackIntervalStats = RunningStatistics()
+    private var trackingStats = TrackingStatistics()
+    private var cornerYBuffer = RingBuffer<Double>(capacity: 240)
+    private var latestTracking = TrackingDiagnostics()
 
     init(settings: Settings = Settings()) {
         self.settings = settings
@@ -207,6 +215,19 @@ final class CaptureCoordinator: @unchecked Sendable {
         processingQueue.async { self.sampler.skinGateEnabled = enabled }
     }
 
+    /// Clears the Stage 1 / Stage 2 measurement window. The procedure is: press this,
+    /// hold still for a minute, read the numbers.
+    func resetStatistics() {
+        processingQueue.async {
+            self.frameIntervalStats.reset()
+            self.trackIntervalStats.reset()
+            self.trackingStats.reset()
+            self.cornerYBuffer.removeAll()
+            self.frameCount = 0
+            self.deliveredFrameCount = 0
+        }
+    }
+
     func setROIScale(_ scale: Double) {
         settings.roiScale = scale
         processingQueue.async { self.roiScale = scale }
@@ -250,6 +271,9 @@ final class CaptureCoordinator: @unchecked Sendable {
         previousFrameTimestamp = nil
         frameIntervalStats.reset()
         trackIntervalStats.reset()
+        trackingStats.reset()
+        cornerYBuffer.removeAll()
+        latestTracking = TrackingDiagnostics()
     }
 
     private func noteDroppedFrame() {
@@ -357,15 +381,37 @@ final class CaptureCoordinator: @unchecked Sendable {
         guard let output else {
             latestFaceQuad = nil
             latestTrackSource = "none"
+            latestTracking.faceTracked = false
+            latestTracking.source = "none"
+            trackingStats.addLost()
             return
         }
         latestFaceQuad = output.faceQuad
         latestRoll = output.roll
-        latestTrackSource = output.source == .detection ? "detection" : "tracking"
+        latestTrackSource = output.source.rawValue
         smoother?.setTarget(output.faceQuad)
+
         // The mean y of the four tracked corners is the respiration signal —
         // `motion(frameCount,:) = mean(bboxPoints)` in the reference.
         engine?.ingestTrack(output.faceQuad)
+        cornerYBuffer.append(output.faceQuad.meanCornerY)
+
+        trackingStats.addTracked(
+            quad: output.faceQuad,
+            roll: output.roll,
+            residualPx: output.rmsResidual
+        )
+
+        latestTracking.faceTracked = true
+        latestTracking.source = output.source.rawValue
+        latestTracking.landmarkCount = output.landmarkCount
+        latestTracking.inlierCount = output.inlierCount
+        latestTracking.rmsResidualPx = output.rmsResidual
+        latestTracking.scale = output.scale
+        latestTracking.anchorCount = output.anchorCount
+        latestTracking.rollDegrees = output.roll * 180 / .pi
+        latestTracking.faceWidthPx = output.faceQuad.width
+        latestTracking.faceHeightPx = output.faceQuad.height
     }
 
     // MARK: - Publishing
@@ -395,35 +441,39 @@ final class CaptureCoordinator: @unchecked Sendable {
         snapshot.isRecording = recorder != nil
         snapshot.recordedRowCount = recorder?.recordedRowCount ?? 0
 
+        // Mean removed so the plot shows the breathing excursion rather than where the
+        // subject happens to sit in the frame.
+        let cornerY = cornerYBuffer.elements
+        if !cornerY.isEmpty {
+            let mean = cornerY.reduce(0, +) / Double(cornerY.count)
+            snapshot.cornerYWaveform = cornerY.map { $0 - mean }
+        }
+
+        var tracking = latestTracking
+        tracking.configuredFrameRate = snapshot.frameRate
+        tracking.measuredFrameRate = snapshot.measuredFrameRate
+        tracking.frameIntervalJitterMs = frameIntervalStats.standardDeviation
+        tracking.deliveredFrameCount = deliveredFrameCount
+        tracking.droppedFrameCount = snapshot.droppedFrameCount
+        tracking.configuredTrackingRate = snapshot.trackingRate
+        tracking.measuredTrackingRate = snapshot.measuredTrackingRate
+        tracking.trackingIntervalJitterMs = trackIntervalStats.standardDeviation
+        tracking.trackingTickCount = trackingStats.tickCount
+        tracking.statsSampleCount = trackingStats.sampleCount
+        tracking.statsSeconds = snapshot.trackingRate > 0
+            ? Double(trackingStats.sampleCount) / snapshot.trackingRate : 0
+        tracking.cornerJitterPx = trackingStats.cornerJitterPx
+        tracking.cornerJitterPercentOfWidth = trackingStats.meanFaceWidthPx > 0
+            ? trackingStats.cornerJitterPx / trackingStats.meanFaceWidthPx * 100 : 0
+        tracking.meanCornerYStdPx = trackingStats.meanCornerYStdPx
+        tracking.rollStdDegrees = trackingStats.rollStdDegrees
+        tracking.residualRmsMeanPx = trackingStats.residualMeanPx
+        tracking.faceLostCount = trackingStats.faceLostCount
+        tracking.lastReacquireTicks = trackingStats.lastReacquireTicks
+        tracking.worstReacquireTicks = trackingStats.worstReacquireTicks
+        snapshot.tracking = tracking
+
         let handler = onSnapshot
         DispatchQueue.main.async { handler?(snapshot) }
-    }
-}
-
-/// Running mean and standard deviation of an interval, for the Stage 1 numbers.
-///
-/// Welford's algorithm over the whole session — deliberately not exponentially
-/// weighted, because the pass criterion is about the run as a whole, not the last
-/// second of it.
-struct IntervalStatistics {
-    private(set) var count = 0
-    private(set) var mean: Double = 0
-    private var m2: Double = 0
-
-    mutating func add(_ value: Double) {
-        guard value.isFinite else { return }
-        count += 1
-        let delta = value - mean
-        mean += delta / Double(count)
-        m2 += delta * (value - mean)
-    }
-
-    var variance: Double { count > 1 ? m2 / Double(count - 1) : 0 }
-    var standardDeviation: Double { variance.squareRoot() }
-
-    mutating func reset() {
-        count = 0
-        mean = 0
-        m2 = 0
     }
 }
