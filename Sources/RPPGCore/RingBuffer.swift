@@ -1,0 +1,60 @@
+import Foundation
+
+/// Fixed-capacity FIFO backed by a flat array. Once full, appending overwrites the
+/// oldest element. Index `0` is always the oldest element still held.
+///
+/// The pipelines keep a few seconds of samples in one of these so a rate estimate can
+/// be recomputed on demand without re-allocating.
+public struct RingBuffer<Element> {
+
+    public let capacity: Int
+    private var storage: [Element]
+    /// Index of the oldest element once the buffer has wrapped.
+    private var head: Int = 0
+
+    public init(capacity: Int) {
+        precondition(capacity > 0, "capacity must be positive")
+        self.capacity = capacity
+        self.storage = []
+        self.storage.reserveCapacity(capacity)
+    }
+
+    public var count: Int { storage.count }
+    public var isEmpty: Bool { storage.isEmpty }
+    public var isFull: Bool { storage.count == capacity }
+
+    public mutating func append(_ element: Element) {
+        if storage.count < capacity {
+            storage.append(element)
+        } else {
+            storage[head] = element
+            head = (head + 1) % capacity
+        }
+    }
+
+    /// - Parameter index: `0` is the oldest retained element, `count - 1` the newest.
+    public subscript(index: Int) -> Element {
+        precondition(index >= 0 && index < storage.count, "index out of range")
+        return storage[(head + index) % storage.count]
+    }
+
+    public var newest: Element? {
+        storage.isEmpty ? nil : self[storage.count - 1]
+    }
+
+    public var oldest: Element? {
+        storage.isEmpty ? nil : self[0]
+    }
+
+    /// Oldest-to-newest snapshot.
+    public var elements: [Element] {
+        guard !storage.isEmpty else { return [] }
+        if head == 0 { return storage }
+        return Array(storage[head...]) + Array(storage[..<head])
+    }
+
+    public mutating func removeAll() {
+        storage.removeAll(keepingCapacity: true)
+        head = 0
+    }
+}

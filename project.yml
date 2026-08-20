@@ -1,0 +1,51 @@
+# XcodeGen spec. `App/RPPG.xcodeproj` is checked in and should open directly in
+# Xcode 16 or later; this file exists so the project can be regenerated from scratch:
+#
+#     brew install xcodegen && xcodegen generate
+#
+name: RPPG
+options:
+  bundleIdPrefix: com.rppg
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+  xcodeVersion: "16.0"
+
+packages:
+  RPPGCore:
+    path: .
+
+targets:
+  RPPG:
+    type: application
+    platform: iOS
+    sources:
+      - path: App/RPPG
+    dependencies:
+      - package: RPPGCore
+        product: RPPGCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.rppg.tablet
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ENABLE_PREVIEWS: YES
+        SWIFT_VERSION: "5.0"
+        GENERATE_INFOPLIST_FILE: YES
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        INFOPLIST_KEY_CFBundleDisplayName: rPPG
+        INFOPLIST_KEY_NSCameraUsageDescription: >-
+          The front camera is used to measure pulse and respiration from small
+          colour changes in the skin. Video is processed on the device and never
+          leaves it.
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UIStatusBarHidden: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: >-
+          UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: >-
+          UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight

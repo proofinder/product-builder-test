@@ -1,0 +1,160 @@
+import Foundation
+
+/// Result of a spectral rate estimate (heart rate or respiration rate).
+public struct SpectralEstimate: Sendable, Equatable {
+
+    /// Peak frequency in Hz, refined by parabolic interpolation between bins.
+    public let frequencyHz: Double
+
+    /// `frequencyHz * 60`, i.e. bpm for pulse and breaths/min for respiration.
+    public let ratePerMinute: Double
+
+    /// Ratio, in dB, of the power inside the fundamental + first harmonic to the
+    /// remaining in-band power. This is the signal-to-noise metric commonly used to
+    /// score rPPG output; above roughly 0 dB the estimate is usually trustworthy.
+    public let signalToNoiseDB: Double
+
+    /// `signalToNoiseDB` squashed into `0 ... 1` for display purposes.
+    public let confidence: Double
+
+    /// Number of samples the estimate was computed from.
+    public let sampleCount: Int
+}
+
+/// Windowed-periodogram rate estimation over a restricted frequency band.
+public enum SpectralRateEstimator {
+
+    /// - Parameters:
+    ///   - signal: time-domain samples, oldest first, uniformly sampled.
+    ///   - sampleRate: sampling rate of `signal`, in Hz.
+    ///   - band: frequency range searched for the peak, in Hz.
+    ///   - harmonicHalfWidth: half-width, in Hz, of the bands considered "signal"
+    ///     around the fundamental and its first harmonic when computing SNR.
+    ///   - zeroPadFactor: transform length multiplier; higher values interpolate the
+    ///     spectrum more finely at the cost of a larger FFT.
+    /// - Returns: `nil` when there are too few samples, the signal is flat, or the
+    ///   band contains no usable bin.
+    public static func estimate(
+        signal: [Double],
+        sampleRate: Double,
+        band: ClosedRange<Double>,
+        harmonicHalfWidth: Double = 0.1,
+        zeroPadFactor: Int = 4
+    ) -> SpectralEstimate? {
+        let n = signal.count
+        // Need at least ~3 cycles of the slowest frequency of interest to say anything.
+        guard n >= 16, sampleRate > 0, band.lowerBound > 0,
+              band.upperBound < sampleRate / 2 else { return nil }
+
+        let detrended = linearDetrend(signal)
+        let energy = detrended.reduce(0) { $0 + $1 * $1 }
+        guard energy > 0, energy.isFinite else { return nil }
+
+        // Hann window: suppresses spectral leakage from the residual baseline drift.
+        var windowed = [Double](repeating: 0, count: n)
+        for i in 0..<n {
+            let w = 0.5 - 0.5 * cos(2 * Double.pi * Double(i) / Double(n - 1))
+            windowed[i] = detrended[i] * w
+        }
+
+        let padded = FFT.nextPowerOfTwo(n * max(1, zeroPadFactor))
+        let power = FFT.powerSpectrum(of: windowed, paddedLength: padded)
+        let binWidth = sampleRate / Double(padded)
+
+        let lowBin = max(1, Int((band.lowerBound / binWidth).rounded(.up)))
+        let highBin = min(power.count - 1, Int((band.upperBound / binWidth).rounded(.down)))
+        guard lowBin < highBin else { return nil }
+
+        var peakBin = lowBin
+        for bin in lowBin...highBin where power[bin] > power[peakBin] {
+            peakBin = bin
+        }
+        guard power[peakBin] > 0 else { return nil }
+
+        let refinedBin = parabolicPeak(power: power, around: peakBin)
+        let frequency = refinedBin * binWidth
+
+        let snr = signalToNoiseDB(
+            power: power,
+            binWidth: binWidth,
+            fundamental: frequency,
+            band: band,
+            harmonicHalfWidth: harmonicHalfWidth
+        )
+
+        return SpectralEstimate(
+            frequencyHz: frequency,
+            ratePerMinute: frequency * 60,
+            signalToNoiseDB: snr,
+            confidence: 1.0 / (1.0 + exp(-snr / 3.0)),
+            sampleCount: n
+        )
+    }
+
+    /// Removes the best-fit straight line. Cheap detrending that kills the ramp a
+    /// slowly drifting baseline leaves behind after band-pass filtering.
+    public static func linearDetrend(_ signal: [Double]) -> [Double] {
+        let n = signal.count
+        guard n > 2 else {
+            let mean = signal.reduce(0, +) / Double(max(n, 1))
+            return signal.map { $0 - mean }
+        }
+        let nd = Double(n)
+        let sumX = nd * (nd - 1) / 2
+        let sumXX = (nd - 1) * nd * (2 * nd - 1) / 6
+        var sumY = 0.0, sumXY = 0.0
+        for (i, y) in signal.enumerated() {
+            sumY += y
+            sumXY += Double(i) * y
+        }
+        let denominator = nd * sumXX - sumX * sumX
+        guard denominator != 0 else {
+            let mean = sumY / nd
+            return signal.map { $0 - mean }
+        }
+        let slope = (nd * sumXY - sumX * sumY) / denominator
+        let intercept = (sumY - slope * sumX) / nd
+        return signal.enumerated().map { $0.element - (slope * Double($0.offset) + intercept) }
+    }
+
+    /// Sub-bin peak location from a parabola through the peak and its two neighbours.
+    private static func parabolicPeak(power: [Double], around bin: Int) -> Double {
+        guard bin > 0, bin < power.count - 1 else { return Double(bin) }
+        let left = power[bin - 1], centre = power[bin], right = power[bin + 1]
+        let denominator = left - 2 * centre + right
+        guard denominator != 0 else { return Double(bin) }
+        let delta = 0.5 * (left - right) / denominator
+        guard abs(delta) <= 1 else { return Double(bin) }
+        return Double(bin) + delta
+    }
+
+    /// de Haan-style SNR: power within +/- `harmonicHalfWidth` of the fundamental and
+    /// its first harmonic, against everything else inside `band`.
+    private static func signalToNoiseDB(
+        power: [Double],
+        binWidth: Double,
+        fundamental: Double,
+        band: ClosedRange<Double>,
+        harmonicHalfWidth: Double
+    ) -> Double {
+        var signalPower = 0.0
+        var noisePower = 0.0
+        let lowBin = max(1, Int((band.lowerBound / binWidth).rounded(.up)))
+        let highBin = min(power.count - 1, Int((band.upperBound / binWidth).rounded(.down)))
+        guard lowBin <= highBin else { return -.infinity }
+
+        for bin in lowBin...highBin {
+            let frequency = Double(bin) * binWidth
+            let nearFundamental = abs(frequency - fundamental) <= harmonicHalfWidth
+            let nearHarmonic = abs(frequency - 2 * fundamental) <= harmonicHalfWidth
+            if nearFundamental || nearHarmonic {
+                signalPower += power[bin]
+            } else {
+                noisePower += power[bin]
+            }
+        }
+        guard signalPower > 0 else { return -.infinity }
+        guard noisePower > 0 else { return .infinity }
+        return 10 * log10(signalPower / noisePower)
+    }
+}
