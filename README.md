@@ -198,9 +198,12 @@ swift run rppg-replay Tests/RPPGCoreTests/Fixtures/synthetic_C.csv --compare <ma
   Python 레퍼런스가 여기서 실행되었고, CSV 왕복 무손실(오차 0)과 72 bpm 복원을 확인했습니다.
 - `App/RPPG.xcodeproj/project.pbxproj`는 손으로 작성했습니다(objectVersion 77, file-system
   synchronized group). Xcode가 열지 못하면 위의 `xcodegen generate`로 재생성하세요.
-- Vision의 `roll` 부호는 y-down 픽셀 좌표계에 맞추어 뒤집었습니다
-  (`FaceTracker.imageRoll(of:)`). ROI 오버레이가 머리 기울기와 반대로 돌면 그 한 줄의 부호를
-  바꾸면 됩니다. Stage 2에서 가장 먼저 확인할 지점입니다.
+- **roll 부호는 앵커 시점에만 Vision에서 옵니다** (`FaceTracker.visionRoll(of:)`에서 y-down
+  좌표계에 맞춰 뒤집음). 앵커 이후의 회전은 피팅된 변환에서 나오고, 그건 이미 이미지 좌표계에서
+  측정되므로 부호 문제가 없습니다. 따라서 확인 방법이 두 가지로 갈립니다:
+  - 머리를 기울일 때 quad가 **따라 돌면** 상대 회전 추적은 정상
+  - 기울인 채로 앱을 시작(=그 자세에서 앵커)했을 때 quad가 **반대로 기울어 있으면**
+    `visionRoll(of:)`의 부호를 뒤집으면 됩니다
 - 트래킹은 레퍼런스 구조(특징점 → similarity 변환 → 코너)를 따르되 KLT 대신 Vision 랜드마크를
   쓰고, 이전 프레임이 아니라 **최초 앵커**에 대해 피팅합니다. 차이는 `docs/PLAN.md` 5절 참고.
 - 화면 회전 대응은 없습니다. landscape 고정 전제입니다.
