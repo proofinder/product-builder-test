@@ -53,6 +53,10 @@ final class CameraSession: NSObject, @unchecked Sendable {
     /// Called on `outputQueue` for every delivered frame.
     var onFrame: (@Sendable (CVPixelBuffer, TimeInterval) -> Void)?
 
+    /// Called for every frame the output dropped. Dropped frames are a Stage 1 pass
+    /// criterion, so they are counted rather than merely logged.
+    var onDrop: (@Sendable () -> Void)?
+
     let session = AVCaptureSession()
 
     /// The frame rate actually negotiated with the device. The DSP is configured from
@@ -277,6 +281,6 @@ extension CameraSession: AVCaptureVideoDataOutputSampleBufferDelegate {
         didDrop sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
     ) {
-        logger.debug("dropped a frame")
+        onDrop?()
     }
 }

@@ -1,100 +1,128 @@
 import Foundation
 
-/// Frame-rate pulse chain: ROI RGB → POS → band-pass → rolling buffer → heart rate.
+/// Frame-rate pulse chain: ROI mean `C` → POS → `rppg`.
+///
+/// Two buffers are kept, and the distinction matters:
+///
+/// * `rppgWaveform` is the specification's `H` exactly as computed — a running sum,
+///   nothing applied to it. This is what gets recorded and compared against MATLAB.
+/// * `analysisWaveform` is a band-passed copy used **only** for the on-screen trace and
+///   the heart-rate estimate. The running sum re-introduces the low frequencies that
+///   `h - hmean` removed, so it drifts; that drift would dominate a spectrum without
+///   being anything to do with the pulse.
+///
+/// Nothing in the analysis path feeds back into the POS state.
 public struct PulsePipeline {
 
     public struct Configuration: Sendable {
 
-        /// Camera frame rate in Hz (30 or 60 on the supported tablets).
+        /// Camera frame rate in Hz, used to size the buffers and the analysis filter.
+        /// Note that it does **not** affect `lambda1`/`lambda2`, which the reference
+        /// fixes as constants.
         public var sampleRate: Double
 
-        /// Pass band for the pulse, in Hz. 0.7 – 4.0 Hz is 42 – 240 bpm.
+        public var pos: POSProcessor.Configuration
+
+        /// Pass band for the analysis copy, in Hz. 0.7–4.0 Hz is 42–240 bpm.
         public var band: ClosedRange<Double>
 
-        /// Length of the analysis buffer, in seconds. Longer buffers sharpen the
-        /// spectral peak but respond more slowly to a changing heart rate.
+        /// Length of the analysis buffer, in seconds. Longer sharpens the spectral peak
+        /// but responds more slowly to a changing heart rate.
         public var bufferSeconds: Double
 
         /// Estimation is refused until the buffer holds this many seconds.
         public var minimumSecondsForEstimate: Double
 
-        public var pos: StreamingPOS.Configuration
-
         public init(
             sampleRate: Double,
+            pos: POSProcessor.Configuration = .reference,
             band: ClosedRange<Double> = 0.7...4.0,
             bufferSeconds: Double = 10,
-            minimumSecondsForEstimate: Double = 6,
-            pos: StreamingPOS.Configuration? = nil
+            minimumSecondsForEstimate: Double = 6
         ) {
             self.sampleRate = sampleRate
+            self.pos = pos
             self.band = band
             self.bufferSeconds = bufferSeconds
             self.minimumSecondsForEstimate = minimumSecondsForEstimate
-            self.pos = pos ?? StreamingPOS.Configuration(sampleRate: sampleRate)
         }
     }
 
     public let configuration: Configuration
 
-    private var pos: StreamingPOS
-    private var bandpass: BandpassFilter
-    private var buffer: RingBuffer<Double>
+    private var processor: POSProcessor
+    private var analysisFilter: BandpassFilter
+    private var rppgBuffer: RingBuffer<Double>
+    private var analysisBuffer: RingBuffer<Double>
     private let minimumSamples: Int
 
     public init(configuration: Configuration) {
         self.configuration = configuration
-        pos = StreamingPOS(configuration: configuration.pos)
-        bandpass = BandpassFilter(
+        processor = POSProcessor(configuration: configuration.pos)
+        analysisFilter = BandpassFilter(
             lowCutoff: configuration.band.lowerBound,
             highCutoff: configuration.band.upperBound,
             sampleRate: configuration.sampleRate,
             order: 4
         )
-        buffer = RingBuffer(
-            capacity: max(16, Int((configuration.bufferSeconds * configuration.sampleRate).rounded()))
+        let capacity = max(16, Int((configuration.bufferSeconds * configuration.sampleRate).rounded()))
+        rppgBuffer = RingBuffer(capacity: capacity)
+        analysisBuffer = RingBuffer(capacity: capacity)
+        minimumSamples = max(
+            16,
+            Int((configuration.minimumSecondsForEstimate * configuration.sampleRate).rounded())
         )
-        minimumSamples = max(16, Int((configuration.minimumSecondsForEstimate * configuration.sampleRate).rounded()))
     }
 
-    /// Feeds one frame. Returns the filtered pulse sample, or `nil` while warming up
-    /// or when the ROI measurement was unusable.
+    /// Feeds one frame's ROI mean.
+    ///
+    /// - Returns: the full POS step, so the caller can record every intermediate, or
+    ///   `nil` when the sample was unusable.
     @discardableResult
-    public mutating func process(_ sample: RGBSample) -> Double? {
-        guard let raw = pos.process(sample) else { return nil }
-        let filtered = bandpass.process(raw)
-        buffer.append(filtered)
-        return filtered
+    public mutating func process(_ sample: ROISample) -> POSProcessor.Step? {
+        guard sample.isUsable, let step = processor.process(sample.channels) else { return nil }
+        rppgBuffer.append(step.rppg)
+        analysisBuffer.append(analysisFilter.process(step.rppg))
+        return step
     }
 
-    /// Oldest-to-newest snapshot of the filtered pulse waveform, for plotting.
-    public var waveform: [Double] { buffer.elements }
+    /// The specification's `H`, oldest to newest, unmodified.
+    public var rppgWaveform: [Double] { rppgBuffer.elements }
 
-    public var bufferedSampleCount: Int { buffer.count }
+    /// Band-passed copy, for display and rate estimation only.
+    public var analysisWaveform: [Double] { analysisBuffer.elements }
 
-    /// Current heart-rate estimate, or `nil` if not enough signal has accumulated.
+    public var bufferedSampleCount: Int { analysisBuffer.count }
+
+    public var currentRPPG: Double { processor.currentRPPG }
+
     public func heartRate() -> SpectralEstimate? {
-        guard buffer.count >= minimumSamples else { return nil }
+        guard analysisBuffer.count >= minimumSamples else { return nil }
         return SpectralRateEstimator.estimate(
-            signal: buffer.elements,
+            signal: analysisBuffer.elements,
             sampleRate: configuration.sampleRate,
             band: configuration.band
         )
     }
 
     public mutating func reset() {
-        pos.reset()
-        bandpass.reset()
-        buffer.removeAll()
+        processor.reset()
+        analysisFilter.reset()
+        rppgBuffer.removeAll()
+        analysisBuffer.removeAll()
     }
 }
 
 /// Tracking-rate respiration chain.
 ///
-/// Per the spec the respiration signal is the mean `y` of the four tracked face
-/// corners: the head rises and falls with the breathing cycle, so that scalar carries
-/// the respiratory waveform at the tracking rate (4 Hz by default — well above the
-/// 0.6 Hz top of the respiration band).
+/// The reference marks the source explicitly:
+///
+/// ```matlab
+/// % motion(frameCount,:) = mean(bboxPoints);   % 1:x축, 2:y축, y축 호흡 신호로 활용
+/// ```
+///
+/// so the signal is the mean `y` of the four tracked corners, sampled at the tracking
+/// rate (4 Hz — comfortably above the 0.6 Hz top of the respiration band).
 public struct RespirationPipeline {
 
     public struct Configuration: Sendable {
@@ -102,10 +130,10 @@ public struct RespirationPipeline {
         /// Rate the tracker emits quads at, in Hz.
         public var sampleRate: Double
 
-        /// Pass band, in Hz. 0.1 – 0.6 Hz is 6 – 36 breaths/min.
+        /// Pass band, in Hz. 0.1–0.6 Hz is 6–36 breaths/min.
         public var band: ClosedRange<Double>
 
-        /// Analysis buffer length in seconds. Respiration is slow, so this needs to be
+        /// Analysis buffer length in seconds. Respiration is slow, so this has to be
         /// far longer than the pulse buffer.
         public var bufferSeconds: Double
 
@@ -113,6 +141,8 @@ public struct RespirationPipeline {
 
         /// When `true` the corner mean is divided by the quad height before filtering,
         /// making the signal independent of how far the subject sits from the tablet.
+        /// The reference does not do this; it is off by default so the recorded signal
+        /// matches `mean(bboxPoints)` directly.
         public var normalizeByFaceHeight: Bool
 
         public init(
@@ -120,7 +150,7 @@ public struct RespirationPipeline {
             band: ClosedRange<Double> = 0.1...0.6,
             bufferSeconds: Double = 45,
             minimumSecondsForEstimate: Double = 20,
-            normalizeByFaceHeight: Bool = true
+            normalizeByFaceHeight: Bool = false
         ) {
             self.sampleRate = sampleRate
             self.band = band
@@ -147,7 +177,10 @@ public struct RespirationPipeline {
         buffer = RingBuffer(
             capacity: max(16, Int((configuration.bufferSeconds * configuration.sampleRate).rounded()))
         )
-        minimumSamples = max(16, Int((configuration.minimumSecondsForEstimate * configuration.sampleRate).rounded()))
+        minimumSamples = max(
+            16,
+            Int((configuration.minimumSecondsForEstimate * configuration.sampleRate).rounded())
+        )
     }
 
     /// Feeds one tracker output. Returns the filtered respiration sample.
@@ -159,7 +192,7 @@ public struct RespirationPipeline {
             guard height > .ulpOfOne else { return nil }
             value /= height
         }
-        // Screen y grows downwards; flip so inhalation (head rising) reads positive.
+        // Screen y grows downwards; flip so a rising head reads positive.
         let filtered = bandpass.process(-value)
         buffer.append(filtered)
         return filtered

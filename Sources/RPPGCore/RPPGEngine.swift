@@ -1,11 +1,9 @@
 import Foundation
 
-/// Everything the UI needs after one camera frame.
+/// Everything the UI and the recorder need after one camera frame.
 public struct RPPGOutput: Sendable {
-    /// Filtered pulse sample for this frame, `nil` while warming up.
-    public var pulseSample: Double?
-    /// Filtered respiration sample, non-`nil` only on frames that carried a tracker update.
-    public var respirationSample: Double?
+    /// The full POS step, `nil` when the frame produced no output.
+    public var posStep: POSProcessor.Step?
     public var heartRate: SpectralEstimate?
     public var respirationRate: SpectralEstimate?
     public var quality: SignalQuality
@@ -18,17 +16,19 @@ public struct SignalQuality: Sendable, Equatable {
     public var clippedFraction: Double
     public var pulseConfidence: Double
     public var secondsBuffered: Double
+    /// POS steps processed since the last reset — the warm-up indicator.
+    public var posStepCount: Int
 
     public static let none = SignalQuality(
         faceTracked: false, roiPixelCount: 0, clippedFraction: 0,
-        pulseConfidence: 0, secondsBuffered: 0
+        pulseConfidence: 0, secondsBuffered: 0, posStepCount: 0
     )
 }
 
-/// Top-level signal engine. Owns the dual-rate split described in the spec:
+/// Top-level signal engine. Owns the dual-rate split from the specification:
 ///
-/// * ``ingestFrame(_:)`` runs at the **frame rate** (30 / 60 Hz) — one ROI RGB
-///   measurement per camera frame, through POS to a pulse sample.
+/// * ``ingestFrame(_:faceTracked:)`` runs at the **frame rate** (30 / 60 Hz) — one ROI
+///   mean `C` per camera frame, through POS to one `rppg` sample.
 /// * ``ingestTrack(_:)`` runs at the **tracking rate** (4 Hz) — one face quad per
 ///   tracker update, whose mean corner `y` is the respiration signal.
 ///
@@ -47,9 +47,10 @@ public final class RPPGEngine {
         public init(
             frameRate: Double,
             trackingRate: Double,
+            pos: POSProcessor.Configuration = .reference,
             estimateInterval: TimeInterval = 0.5
         ) {
-            pulse = PulsePipeline.Configuration(sampleRate: frameRate)
+            pulse = PulsePipeline.Configuration(sampleRate: frameRate, pos: pos)
             respiration = RespirationPipeline.Configuration(sampleRate: trackingRate)
             self.estimateInterval = estimateInterval
         }
@@ -63,8 +64,8 @@ public final class RPPGEngine {
     private var cachedHeartRate: SpectralEstimate?
     private var cachedRespirationRate: SpectralEstimate?
     private var lastEstimateTimestamp: TimeInterval = -.infinity
-
     private var lastQuality: SignalQuality = .none
+    private var posStepCount = 0
 
     public init(configuration: Configuration) {
         self.configuration = configuration
@@ -74,8 +75,9 @@ public final class RPPGEngine {
 
     /// Frame-rate entry point.
     @discardableResult
-    public func ingestFrame(_ sample: RGBSample, faceTracked: Bool) -> RPPGOutput {
-        let pulseSample = faceTracked ? pulsePipeline.process(sample) : nil
+    public func ingestFrame(_ sample: ROISample, faceTracked: Bool) -> RPPGOutput {
+        let step = faceTracked ? pulsePipeline.process(sample) : nil
+        if step != nil { posStepCount += 1 }
 
         if sample.timestamp - lastEstimateTimestamp >= configuration.estimateInterval {
             lastEstimateTimestamp = sample.timestamp
@@ -88,12 +90,12 @@ public final class RPPGEngine {
             roiPixelCount: sample.pixelCount,
             clippedFraction: sample.clippedFraction,
             pulseConfidence: cachedHeartRate?.confidence ?? 0,
-            secondsBuffered: Double(pulsePipeline.bufferedSampleCount) / configuration.pulse.sampleRate
+            secondsBuffered: Double(pulsePipeline.bufferedSampleCount) / configuration.pulse.sampleRate,
+            posStepCount: posStepCount
         )
 
         return RPPGOutput(
-            pulseSample: pulseSample,
-            respirationSample: nil,
+            posStep: step,
             heartRate: cachedHeartRate,
             respirationRate: cachedRespirationRate,
             quality: lastQuality
@@ -106,14 +108,17 @@ public final class RPPGEngine {
         respirationPipeline.process(quad: quad)
     }
 
-    public var pulseWaveform: [Double] { pulsePipeline.waveform }
+    /// The specification's `H`, unmodified.
+    public var rppgWaveform: [Double] { pulsePipeline.rppgWaveform }
+    /// Band-passed copy, for display and rate estimation only.
+    public var pulseAnalysisWaveform: [Double] { pulsePipeline.analysisWaveform }
     public var respirationWaveform: [Double] { respirationPipeline.waveform }
     public var heartRate: SpectralEstimate? { cachedHeartRate }
     public var respirationRate: SpectralEstimate? { cachedRespirationRate }
     public var quality: SignalQuality { lastQuality }
 
-    /// Clears every persistent filter state. Call when the face is lost for long
-    /// enough that the buffered history is no longer about the same subject.
+    /// Clears every persistent filter state. Call when the face has been lost long
+    /// enough that the buffered history is no longer about the same measurement.
     public func reset() {
         pulsePipeline.reset()
         respirationPipeline.reset()
@@ -121,5 +126,6 @@ public final class RPPGEngine {
         cachedRespirationRate = nil
         lastEstimateTimestamp = -.infinity
         lastQuality = .none
+        posStepCount = 0
     }
 }

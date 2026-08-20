@@ -1,36 +1,24 @@
 import XCTest
 @testable import RPPGCore
 
+/// The POS-facing recurrence checks live in `POSTests`; this covers the auxiliary
+/// constructor and the robustness behaviour the capture path depends on.
 final class EWMATests: XCTestCase {
-
-    func testRecurrenceMatchesSpecification() {
-        // y = lambda * y + (1 - lambda) * x, with y primed by the first sample.
-        let lambda = 0.9
-        var filter = EWMA(lambda: lambda)
-        let inputs: [Double] = [10, 12, 8, 20, 5]
-
-        var expected = inputs[0]
-        XCTAssertEqual(filter.update(inputs[0]), expected, accuracy: 1e-12)
-
-        for x in inputs.dropFirst() {
-            expected = lambda * expected + (1 - lambda) * x
-            XCTAssertEqual(filter.update(x), expected, accuracy: 1e-12)
-        }
-    }
 
     func testStatePersistsAcrossCalls() {
         var filter = EWMA(lambda: 0.5)
         filter.update(0)
         filter.update(1)
-        XCTAssertEqual(filter.value, 0.5, accuracy: 1e-12)
+        XCTAssertEqual(filter.value, 0.5, accuracy: 1e-15)
         filter.update(1)
-        XCTAssertEqual(filter.value, 0.75, accuracy: 1e-12)
+        XCTAssertEqual(filter.value, 0.75, accuracy: 1e-15)
     }
 
-    func testTimeConstantDecaysToOneOverE() {
+    func testTimeConstantConstructorDecaysToOneOverE() {
+        // Used for the ROI smoother and the frame-rate estimate, not for POS.
         let tau = 2.0, fs = 50.0
         var filter = EWMA(timeConstant: tau, sampleRate: fs)
-        filter.update(1)                       // primes at 1
+        filter.update(1)
         for _ in 0..<Int(tau * fs) {
             filter.update(0)
         }
@@ -38,27 +26,24 @@ final class EWMATests: XCTestCase {
     }
 
     func testNonFiniteInputIsIgnored() {
+        // One bad frame — an empty ROI producing NaN — must not poison the persistent
+        // state for every frame that follows.
         var filter = EWMA(lambda: 0.5)
         filter.update(4)
         filter.update(.nan)
         filter.update(.infinity)
-        XCTAssertEqual(filter.value, 4, accuracy: 1e-12)
+        XCTAssertEqual(filter.value, 4, accuracy: 0)
+        XCTAssertTrue(filter.isPrimed)
     }
 
-    func testExponentialStatisticsApproximateSampleStatistics() {
-        // A long stretch of a stationary sine: EW mean -> 0, EW sd -> amplitude/sqrt(2).
-        var statistics = EWStatistics(timeConstant: 4, sampleRate: 100)
-        for index in 0..<4000 {
-            statistics.update(3 * sin(2 * Double.pi * 1.1 * Double(index) / 100))
-        }
-        XCTAssertEqual(statistics.mean, 0, accuracy: 0.15)
-        XCTAssertEqual(statistics.standardDeviation, 3 / 2.0.squareRoot(), accuracy: 0.15)
-    }
-
-    func testHighPassRemovesConstantBaseline() {
-        var highPass = EWMAHighPass(timeConstant: 0.5, sampleRate: 100)
-        for _ in 0..<500 { highPass.process(7) }
-        XCTAssertEqual(highPass.process(7), 0, accuracy: 1e-6)
-        XCTAssertEqual(highPass.process(8), 1, accuracy: 0.05)
+    func testResetClearsPriming() {
+        var filter = EWMA(lambda: 0.9)
+        filter.update(42)
+        XCTAssertTrue(filter.isPrimed)
+        filter.reset()
+        XCTAssertFalse(filter.isPrimed)
+        XCTAssertEqual(filter.value, 0, accuracy: 0)
+        // The next sample primes again rather than decaying from zero.
+        XCTAssertEqual(filter.update(7), 7, accuracy: 0)
     }
 }

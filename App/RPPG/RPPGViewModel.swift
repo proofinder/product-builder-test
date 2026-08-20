@@ -3,6 +3,16 @@ import RPPGCore
 import SwiftUI
 import UIKit
 
+/// Which trace the debug plot shows. Every POS intermediate is selectable, because
+/// stage-by-stage verification means being able to look at each one on its own.
+enum DebugSignal: String, CaseIterable, Identifiable {
+    case rppg = "rPPG (H)"
+    case rppgFiltered = "rPPG band-passed"
+    case respiration = "Respiration (mean corner y)"
+
+    var id: String { rawValue }
+}
+
 /// Main-actor face of the capture stack. Holds nothing but published UI state; all the
 /// real work lives on ``CaptureCoordinator``'s private queues.
 @MainActor
@@ -13,9 +23,20 @@ final class RPPGViewModel: ObservableObject {
     @Published var errorMessage: String?
 
     @Published var showsROIOverlay = true
+    @Published var debugSignal: DebugSignal = .rppgFiltered
+
     @Published var skinGateEnabled = false {
         didSet { coordinator.setSkinGateEnabled(skinGateEnabled) }
     }
+
+    /// 0.8 per the written specification; 1.0 matches the MATLAB reference, which
+    /// averages the whole rotated box. Switch to 1.0 for a run being cross-checked.
+    @Published var roiScale: Double = 0.8 {
+        didSet { coordinator.setROIScale(roiScale) }
+    }
+
+    /// URL of the finished recording, presented for export.
+    @Published var finishedRecording: URL?
 
     let coordinator: CaptureCoordinator
 
@@ -27,6 +48,8 @@ final class RPPGViewModel: ObservableObject {
             Task { @MainActor in self?.snapshot = snapshot }
         }
     }
+
+    // MARK: - Lifecycle
 
     func start() async {
         guard !isRunning else { return }
@@ -53,7 +76,8 @@ final class RPPGViewModel: ObservableObject {
 
     func resetSignal() {
         coordinator.resetSignal()
-        snapshot.pulseWaveform = []
+        snapshot.rppgWaveform = []
+        snapshot.pulseAnalysisWaveform = []
         snapshot.respirationWaveform = []
         snapshot.heartRate = nil
         snapshot.respirationRate = nil
@@ -61,6 +85,23 @@ final class RPPGViewModel: ObservableObject {
 
     func rebalanceCamera() {
         coordinator.rebalanceCamera()
+    }
+
+    // MARK: - Recording
+
+    func toggleRecording() {
+        if snapshot.isRecording {
+            coordinator.stopRecording { [weak self] url in
+                Task { @MainActor in self?.finishedRecording = url }
+            }
+        } else {
+            do {
+                try coordinator.startRecording()
+                finishedRecording = nil
+            } catch {
+                errorMessage = "Could not start recording: \(error.localizedDescription)"
+            }
+        }
     }
 
     // MARK: - Display helpers
@@ -73,6 +114,18 @@ final class RPPGViewModel: ObservableObject {
     var respirationRateText: String {
         guard let estimate = snapshot.respirationRate, estimate.confidence > 0.25 else { return "--" }
         return String(format: "%.0f", estimate.ratePerMinute)
+    }
+
+    var debugSamples: [Double] {
+        switch debugSignal {
+        case .rppg: return snapshot.rppgWaveform
+        case .rppgFiltered: return snapshot.pulseAnalysisWaveform
+        case .respiration: return snapshot.respirationWaveform
+        }
+    }
+
+    var debugSampleRate: Double {
+        debugSignal == .respiration ? snapshot.trackingRate : snapshot.frameRate
     }
 
     var statusText: String {

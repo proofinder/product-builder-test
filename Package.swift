@@ -8,12 +8,20 @@ let package = Package(
         .macOS(.v13)
     ],
     products: [
-        .library(name: "RPPGCore", targets: ["RPPGCore"])
+        .library(name: "RPPGCore", targets: ["RPPGCore"]),
+        // Offline runner: re-computes POS from a recording's cR/cG/cB columns, so a
+        // capture can be replayed and cross-checked without a device.
+        .executable(name: "rppg-replay", targets: ["rppg-replay"])
     ],
     targets: [
-        // Pure-Swift signal processing core: no AVFoundation / Vision / Accelerate,
-        // so it can be unit tested on any platform (including Linux CI).
+        // Pure-Swift signal core: no AVFoundation / Vision / Accelerate, so it can be
+        // unit tested on any platform.
         .target(name: "RPPGCore"),
-        .testTarget(name: "RPPGCoreTests", dependencies: ["RPPGCore"])
+        .executableTarget(name: "rppg-replay", dependencies: ["RPPGCore"]),
+        .testTarget(
+            name: "RPPGCoreTests",
+            dependencies: ["RPPGCore"],
+            resources: [.copy("Fixtures")]
+        )
     ]
 )

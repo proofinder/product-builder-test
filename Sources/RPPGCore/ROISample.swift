@@ -1,12 +1,11 @@
 import Foundation
 
-/// One spatially averaged RGB measurement of the skin ROI, produced once per camera
-/// frame. Channel values are in `0 ... 255`.
-public struct RGBSample: Sendable, Equatable {
+/// One frame's ROI measurement: the `C` vector plus the quality metadata needed to
+/// decide whether it should be trusted.
+public struct ROISample: Sendable, Equatable {
 
-    public var red: Double
-    public var green: Double
-    public var blue: Double
+    /// The specification's `C(1:3,1) = mean(mean(faceimg))`, on the 0–255 scale.
+    public var channels: ChannelTriple
 
     /// Presentation timestamp of the source frame, in seconds.
     public var timestamp: TimeInterval
@@ -20,26 +19,20 @@ public struct RGBSample: Sendable, Equatable {
     public var clippedFraction: Double
 
     public init(
-        red: Double,
-        green: Double,
-        blue: Double,
+        channels: ChannelTriple,
         timestamp: TimeInterval,
         pixelCount: Int = 0,
         clippedFraction: Double = 0
     ) {
-        self.red = red
-        self.green = green
-        self.blue = blue
+        self.channels = channels
         self.timestamp = timestamp
         self.pixelCount = pixelCount
         self.clippedFraction = clippedFraction
     }
 
-    /// `true` when every channel is finite and strictly positive, which is what the
-    /// POS temporal normalisation requires.
-    public var isUsable: Bool {
-        red.isFinite && green.isFinite && blue.isFinite
-            && red > 0 && green > 0 && blue > 0
-            && pixelCount > 0
+    public static func empty(timestamp: TimeInterval) -> ROISample {
+        ROISample(channels: .zero, timestamp: timestamp, pixelCount: 0)
     }
+
+    public var isUsable: Bool { pixelCount > 0 && channels.isUsable }
 }

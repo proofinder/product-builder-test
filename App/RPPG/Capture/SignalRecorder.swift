@@ -1,0 +1,103 @@
+import Foundation
+import RPPGCore
+import os
+
+/// Writes one ``SignalRecord`` per frame to a CSV in the app's Documents directory.
+///
+/// This is the Stage 0 deliverable: without a recording that carries every POS
+/// intermediate at full precision, none of the later stages can be checked against
+/// anything. The file is exportable from the UI, and feeding its `cR,cG,cB` columns
+/// back through `rppg-replay` must reproduce its own `rppg` column exactly.
+///
+/// Rows are buffered on the caller's queue and flushed on a private I/O queue, so the
+/// frame path never blocks on the filesystem.
+final class SignalRecorder: @unchecked Sendable {
+
+    /// Rows buffered before a flush is dispatched. 64 rows is ~1 s at 60 fps.
+    private static let flushThreshold = 64
+
+    let url: URL
+
+    private let ioQueue = DispatchQueue(label: "rppg.recorder.io", qos: .utility)
+    private let handle: FileHandle
+    private var pending: [String] = []
+    private let logger = Logger(subsystem: "com.rppg.tablet", category: "SignalRecorder")
+
+    /// Creates the file and writes the header.
+    init(directory: URL, name: String) throws {
+        url = directory.appendingPathComponent(name)
+        let header = SignalCSV.headerLine + "\n"
+        guard FileManager.default.createFile(atPath: url.path, contents: Data(header.utf8)) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        handle = try FileHandle(forWritingTo: url)
+        try handle.seekToEnd()
+        pending.reserveCapacity(Self.flushThreshold)
+    }
+
+    /// Number of rows accepted so far. Owned by the caller's queue.
+    private(set) var recordedRowCount = 0
+
+    /// Appends one frame. Call from the processing queue only.
+    func append(_ record: SignalRecord) {
+        pending.append(SignalCSV.line(for: record))
+        recordedRowCount += 1
+        if pending.count >= Self.flushThreshold {
+            flushPending()
+        }
+    }
+
+    /// Flushes and closes. Call from the processing queue only; the returned URL is
+    /// valid once `completion` fires on `queue`.
+    func finish(on queue: DispatchQueue = .main, completion: @escaping (URL) -> Void) {
+        flushPending()
+        let url = self.url
+        ioQueue.async {
+            try? self.handle.synchronize()
+            try? self.handle.close()
+            queue.async { completion(url) }
+        }
+    }
+
+    private func flushPending() {
+        guard !pending.isEmpty else { return }
+        let chunk = pending.joined(separator: "\n") + "\n"
+        pending.removeAll(keepingCapacity: true)
+        ioQueue.async {
+            do {
+                try self.handle.write(contentsOf: Data(chunk.utf8))
+            } catch {
+                self.logger.error("recorder write failed: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+    }
+
+    // MARK: - Helpers
+
+    static var documentsDirectory: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+    }
+
+    /// `rppg-2026-08-20-141530.csv`
+    static func timestampedName(now: Date = Date()) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd-HHmmss"
+        return "rppg-\(formatter.string(from: now)).csv"
+    }
+
+    /// Recordings already on disk, newest first.
+    static func existingRecordings() -> [URL] {
+        let contents = (try? FileManager.default.contentsOfDirectory(
+            at: documentsDirectory,
+            includingPropertiesForKeys: [.contentModificationDateKey]
+        )) ?? []
+        return contents
+            .filter { $0.pathExtension == "csv" }
+            .sorted { left, right in
+                let l = (try? left.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                let r = (try? right.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                return l > r
+            }
+    }
+}

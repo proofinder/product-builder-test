@@ -6,29 +6,46 @@ import os
 
 /// Snapshot handed to the UI. Produced on the processing queue, delivered on main.
 struct CaptureSnapshot: Sendable {
-    var pulseWaveform: [Double] = []
+    /// The specification's `H`, unmodified.
+    var rppgWaveform: [Double] = []
+    /// Band-passed copy of `H`, for display and rate estimation only.
+    var pulseAnalysisWaveform: [Double] = []
     var respirationWaveform: [Double] = []
+    /// The most recent POS step, so the debug view can show every intermediate live.
+    var posStep: POSProcessor.Step?
     var heartRate: SpectralEstimate?
     var respirationRate: SpectralEstimate?
     var quality: SignalQuality = .none
+
     /// Tracked face box in image pixel coordinates, for the overlay.
     var faceQuad: FaceQuad?
-    /// The central-80% ROI actually sampled.
+    /// The ROI actually sampled.
     var roiQuad: FaceQuad?
     var imageSize: CGSize = .zero
+
     /// Frame rate the DSP is configured for.
     var frameRate: Double = 0
     /// Frame rate actually observed from the presentation timestamps.
     var measuredFrameRate: Double = 0
+    /// Standard deviation of the frame interval, ms — the Stage 1 jitter figure.
+    var frameIntervalJitterMs: Double = 0
     var trackingRate: Double = 0
+    /// Measured tracking-tick rate, Hz.
+    var measuredTrackingRate: Double = 0
     var rollDegrees: Double = 0
+    var droppedFrameCount: Int = 0
+    var deliveredFrameCount: Int = 0
+    var trackSource: String = "none"
+
+    var isRecording = false
+    var recordedRowCount = 0
 }
 
-/// Wires the camera, the tracker, the ROI sampler and the DSP engine together, and
-/// owns the **frame rate / tracking rate split** the spec asks for.
+/// Wires the camera, the tracker, the ROI sampler, the DSP engine and the recorder
+/// together, and owns the **frame rate / tracking rate split** from the specification.
 ///
-/// * Every frame (30 or 60 Hz) → glide the ROI forward, average its pixels, push one
-///   ``RGBSample`` through POS.
+/// * Every frame (30 or 60 Hz) → glide the ROI forward, average its pixels into `C`,
+///   push one POS step.
 /// * Every tracking tick (4 Hz) → hand the newest frame to Vision on a *separate*
 ///   queue, and feed the resulting quad's mean corner `y` into the respiration chain.
 ///
@@ -36,19 +53,18 @@ struct CaptureSnapshot: Sendable {
 /// instead of dropping camera frames. At most one detection is in flight; ticks that
 /// come due while one is running are skipped.
 ///
-/// Threading contract: every stored property below is owned by `processingQueue`
-/// except `onSnapshot`, which is set once before ``start()``. This class is
-/// deliberately *not* an actor — the frame path must stay synchronous and
-/// allocation-free.
-/// `@unchecked Sendable` is a claim about the threading contract above, not an
-/// escape hatch: the processing state is confined to `processingQueue`, the camera
-/// handle to the main actor, and the tracker to `visionQueue`.
+/// Threading contract: every stored property is owned by `processingQueue` except the
+/// camera handle and `onSnapshot`, which belong to the main actor.
+/// `@unchecked Sendable` is a claim about that contract, not an escape hatch.
 final class CaptureCoordinator: @unchecked Sendable {
 
     struct Settings {
         var targetFrameRate: Double = 60
         var trackingRate: Double = 4
-        /// Central fraction of the face used as the skin ROI. 0.8 per the spec.
+        /// Central fraction of the face used as the skin ROI.
+        ///
+        /// The written specification says 0.8. Note the MATLAB reference averages the
+        /// **whole** rotated box, so a run being compared against it must use 1.0.
         var roiScale: Double = 0.8
         /// EWMA time constant, in seconds, for gliding the ROI between tracking ticks.
         var roiSmoothingTimeConstant: Double = 0.25
@@ -57,6 +73,7 @@ final class CaptureCoordinator: @unchecked Sendable {
         var resetAfterFaceLoss: TimeInterval = 3.0
         /// UI refresh rate, Hz.
         var publishRate: Double = 15
+        var pos: POSProcessor.Configuration = .reference
     }
 
     /// Delivered on the main queue.
@@ -75,19 +92,25 @@ final class CaptureCoordinator: @unchecked Sendable {
     private var engine: RPPGEngine?
     private var smoother: QuadSmoother?
     private var sampler = ROISampler()
+    private var recorder: SignalRecorder?
     private var roiScale: Double = 0.8
     private var trackingInterval: TimeInterval = 0.25
     private var faceLossTimeout: TimeInterval = 3.0
     private var publishInterval: TimeInterval = 1.0 / 15.0
 
     private var latestFaceQuad: FaceQuad?
+    private var latestTrackSource = "none"
+    private var latestRoll: Double = 0
     private var imageSize: CGSize = .zero
+    private var frameCount = 0
+    private var deliveredFrameCount = 0
     private var lastTrackTimestamp: TimeInterval = -.infinity
     private var lastFaceSeenTimestamp: TimeInterval = -.infinity
     private var lastPublishTimestamp: TimeInterval = -.infinity
     private var visionBusy = false
-    private var frameRateEstimate = EWMA(lambda: 0.95)
     private var previousFrameTimestamp: TimeInterval?
+    private var frameIntervalStats = IntervalStatistics()
+    private var trackIntervalStats = IntervalStatistics()
 
     init(settings: Settings = Settings()) {
         self.settings = settings
@@ -100,7 +123,6 @@ final class CaptureCoordinator: @unchecked Sendable {
 
     /// Starts the camera and builds the DSP chain around the frame rate the device
     /// actually granted.
-    /// - Throws: ``CameraSession/StartError``.
     @MainActor
     func start() async throws {
         guard camera == nil else { return }
@@ -111,6 +133,9 @@ final class CaptureCoordinator: @unchecked Sendable {
         )
         camera.onFrame = { [weak self] pixelBuffer, timestamp in
             self?.handleFrame(pixelBuffer, timestamp: timestamp)
+        }
+        camera.onDrop = { [weak self] in
+            self?.processingQueue.async { self?.noteDroppedFrame() }
         }
 
         do {
@@ -125,7 +150,11 @@ final class CaptureCoordinator: @unchecked Sendable {
         let settings = self.settings
         processingQueue.sync {
             self.engine = RPPGEngine(
-                configuration: .init(frameRate: frameRate, trackingRate: settings.trackingRate)
+                configuration: .init(
+                    frameRate: frameRate,
+                    trackingRate: settings.trackingRate,
+                    pos: settings.pos
+                )
             )
             self.smoother = QuadSmoother(
                 timeConstant: settings.roiSmoothingTimeConstant,
@@ -146,6 +175,8 @@ final class CaptureCoordinator: @unchecked Sendable {
         camera?.stop()
         camera = nil
         processingQueue.sync {
+            self.recorder?.finish { _ in }
+            self.recorder = nil
             self.engine = nil
             self.smoother = nil
             self.clearProcessingState()
@@ -163,9 +194,8 @@ final class CaptureCoordinator: @unchecked Sendable {
         visionQueue.async { self.tracker.reset() }
     }
 
-    /// Re-runs auto exposure / white balance and then re-locks them. Worth offering in
-    /// the UI: once exposure is locked, a change in room lighting cannot be corrected
-    /// any other way.
+    /// Re-runs auto exposure / white balance and then re-locks them. Once exposure is
+    /// locked a change in room lighting cannot be corrected any other way.
     @MainActor
     func rebalanceCamera() {
         camera?.relock()
@@ -177,13 +207,53 @@ final class CaptureCoordinator: @unchecked Sendable {
         processingQueue.async { self.sampler.skinGateEnabled = enabled }
     }
 
+    func setROIScale(_ scale: Double) {
+        settings.roiScale = scale
+        processingQueue.async { self.roiScale = scale }
+    }
+
+    // MARK: - Recording (Stage 0)
+
+    /// Begins a recording. Returns the file URL, or throws if the file cannot be made.
+    @discardableResult
+    func startRecording(name: String = SignalRecorder.timestampedName()) throws -> URL {
+        let recorder = try SignalRecorder(directory: SignalRecorder.documentsDirectory, name: name)
+        processingQueue.async {
+            self.recorder?.finish { _ in }
+            self.recorder = recorder
+        }
+        logger.info("recording to \(recorder.url.lastPathComponent, privacy: .public)")
+        return recorder.url
+    }
+
+    /// Ends the recording; `completion` receives the finished file on the main queue.
+    func stopRecording(completion: @escaping (URL?) -> Void) {
+        processingQueue.async {
+            guard let recorder = self.recorder else {
+                DispatchQueue.main.async { completion(nil) }
+                return
+            }
+            self.recorder = nil
+            recorder.finish { url in completion(url) }
+        }
+    }
+
     private func clearProcessingState() {
         latestFaceQuad = nil
+        latestTrackSource = "none"
+        latestRoll = 0
+        frameCount = 0
+        deliveredFrameCount = 0
         lastTrackTimestamp = -.infinity
         lastFaceSeenTimestamp = -.infinity
         lastPublishTimestamp = -.infinity
         previousFrameTimestamp = nil
-        frameRateEstimate.reset()
+        frameIntervalStats.reset()
+        trackIntervalStats.reset()
+    }
+
+    private func noteDroppedFrame() {
+        frameCount += 1
     }
 
     // MARK: - Frame path (frame rate: 30 / 60 Hz)
@@ -194,8 +264,13 @@ final class CaptureCoordinator: @unchecked Sendable {
         dispatchPrecondition(condition: .onQueue(processingQueue))
         guard let engine, let smoother else { return }
 
+        frameCount += 1
+        deliveredFrameCount += 1
+
+        var dtMs = Double.nan
         if let previous = previousFrameTimestamp, timestamp > previous {
-            frameRateEstimate.update(1 / (timestamp - previous))
+            dtMs = (timestamp - previous) * 1000
+            frameIntervalStats.add(dtMs)
         }
         previousFrameTimestamp = timestamp
         imageSize = CGSize(
@@ -205,6 +280,9 @@ final class CaptureCoordinator: @unchecked Sendable {
 
         // 1. Tracking-rate gate: hand this frame to Vision when a tick is due.
         if timestamp - lastTrackTimestamp >= trackingInterval, !visionBusy {
+            if lastTrackTimestamp.isFinite {
+                trackIntervalStats.add((timestamp - lastTrackTimestamp) * 1000)
+            }
             lastTrackTimestamp = timestamp
             visionBusy = true
             visionQueue.async { [weak self] in
@@ -222,18 +300,36 @@ final class CaptureCoordinator: @unchecked Sendable {
         //    would land right inside the pulse band.
         var faceTracked = false
         var roiQuad: FaceQuad?
-        var sample = RGBSample(red: 0, green: 0, blue: 0, timestamp: timestamp, pixelCount: 0)
+        var sample = ROISample.empty(timestamp: timestamp)
 
         if latestFaceQuad != nil, let smoothed = smoother.advance() {
             let roi = smoothed.scaled(roiScale)
             roiQuad = roi
             sample = sampler.sample(roi: roi, pixelBuffer: pixelBuffer, timestamp: timestamp)
-            faceTracked = sample.pixelCount > 0
+            faceTracked = sample.isUsable
         }
 
         let output = engine.ingestFrame(sample, faceTracked: faceTracked)
 
-        // 3. Drop stale state once the face has been gone long enough that the buffered
+        // 3. Record before anything can reset it.
+        if let recorder {
+            recorder.append(
+                SignalRecord(
+                    frameCount: frameCount,
+                    t: timestamp,
+                    dtMs: dtMs,
+                    corners: latestFaceQuad?.corners ?? [],
+                    roll: latestRoll,
+                    meanCornerY: latestFaceQuad?.meanCornerY ?? .nan,
+                    roiPixelCount: sample.pixelCount,
+                    trackSource: latestTrackSource,
+                    faceTracked: faceTracked,
+                    pos: output.posStep
+                )
+            )
+        }
+
+        // 4. Drop stale state once the face has been gone long enough that the buffered
         //    history is no longer about the same measurement.
         if faceTracked {
             lastFaceSeenTimestamp = timestamp
@@ -242,11 +338,12 @@ final class CaptureCoordinator: @unchecked Sendable {
             engine.reset()
             smoother.reset()
             latestFaceQuad = nil
+            latestTrackSource = "none"
             lastFaceSeenTimestamp = -.infinity
             logger.info("face lost, accumulated signal discarded")
         }
 
-        // 4. Publish at a human rate, not at the frame rate.
+        // 5. Publish at a human rate, not at the frame rate.
         if timestamp - lastPublishTimestamp >= publishInterval {
             lastPublishTimestamp = timestamp
             publish(output: output, roiQuad: roiQuad)
@@ -259,12 +356,15 @@ final class CaptureCoordinator: @unchecked Sendable {
         dispatchPrecondition(condition: .onQueue(processingQueue))
         guard let output else {
             latestFaceQuad = nil
+            latestTrackSource = "none"
             return
         }
         latestFaceQuad = output.faceQuad
+        latestRoll = output.roll
+        latestTrackSource = output.source == .detection ? "detection" : "tracking"
         smoother?.setTarget(output.faceQuad)
-        // Step 1 of the spec: the mean y of the four tracked corners is the
-        // respiration signal, sampled here at the tracking rate.
+        // The mean y of the four tracked corners is the respiration signal —
+        // `motion(frameCount,:) = mean(bboxPoints)` in the reference.
         engine?.ingestTrack(output.faceQuad)
     }
 
@@ -273,8 +373,10 @@ final class CaptureCoordinator: @unchecked Sendable {
     private func publish(output: RPPGOutput, roiQuad: FaceQuad?) {
         guard let engine else { return }
         var snapshot = CaptureSnapshot()
-        snapshot.pulseWaveform = engine.pulseWaveform
+        snapshot.rppgWaveform = engine.rppgWaveform
+        snapshot.pulseAnalysisWaveform = engine.pulseAnalysisWaveform
         snapshot.respirationWaveform = engine.respirationWaveform
+        snapshot.posStep = output.posStep
         snapshot.heartRate = output.heartRate
         snapshot.respirationRate = output.respirationRate
         snapshot.quality = output.quality
@@ -283,10 +385,45 @@ final class CaptureCoordinator: @unchecked Sendable {
         snapshot.imageSize = imageSize
         snapshot.frameRate = engine.configuration.pulse.sampleRate
         snapshot.trackingRate = engine.configuration.respiration.sampleRate
-        snapshot.measuredFrameRate = frameRateEstimate.value
-        snapshot.rollDegrees = (latestFaceQuad?.roll ?? 0) * 180 / .pi
+        snapshot.measuredFrameRate = frameIntervalStats.mean > 0 ? 1000 / frameIntervalStats.mean : 0
+        snapshot.frameIntervalJitterMs = frameIntervalStats.standardDeviation
+        snapshot.measuredTrackingRate = trackIntervalStats.mean > 0 ? 1000 / trackIntervalStats.mean : 0
+        snapshot.rollDegrees = latestRoll * 180 / .pi
+        snapshot.trackSource = latestTrackSource
+        snapshot.deliveredFrameCount = deliveredFrameCount
+        snapshot.droppedFrameCount = max(0, frameCount - deliveredFrameCount)
+        snapshot.isRecording = recorder != nil
+        snapshot.recordedRowCount = recorder?.recordedRowCount ?? 0
 
         let handler = onSnapshot
         DispatchQueue.main.async { handler?(snapshot) }
+    }
+}
+
+/// Running mean and standard deviation of an interval, for the Stage 1 numbers.
+///
+/// Welford's algorithm over the whole session — deliberately not exponentially
+/// weighted, because the pass criterion is about the run as a whole, not the last
+/// second of it.
+struct IntervalStatistics {
+    private(set) var count = 0
+    private(set) var mean: Double = 0
+    private var m2: Double = 0
+
+    mutating func add(_ value: Double) {
+        guard value.isFinite else { return }
+        count += 1
+        let delta = value - mean
+        mean += delta / Double(count)
+        m2 += delta * (value - mean)
+    }
+
+    var variance: Double { count > 1 ? m2 / Double(count - 1) : 0 }
+    var standardDeviation: Double { variance.squareRoot() }
+
+    mutating func reset() {
+        count = 0
+        mean = 0
+        m2 = 0
     }
 }

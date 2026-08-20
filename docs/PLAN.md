@@ -4,24 +4,41 @@
 
 ---
 
-## 0. 먼저: 현재 코드와 확정 사양의 차이
+## 진행 현황
+
+| Stage | 상태 |
+|---|---|
+| 0. 검증 인프라 | **완료** — CSV 스키마·기록기·`rppg-replay`·`pos_reference.m`·골든 픽스처 |
+| 1. 캡처 + 레이트 이원화 | 코드 완료, **기기 검증 대기** |
+| 2. 검출·트래킹·rotation | 코드 완료, **기기 검증 대기** (Vision 기반. 아래 "레퍼런스와의 차이" 참고) |
+| 3. ROI + C | 코드 완료, **기기 검증 대기** |
+| 4. EWMA | **완료** — 사양 점화식 고정, 유닛 테스트 |
+| 5. POS | **완료** — MATLAB 133–170행 그대로, 골든 대조 테스트 |
+| 6. 호흡 | 코드 완료, **기기 검증 대기** |
+| 7. 심박 + 마감 | 후처리만 배선됨 |
+
+`lambda1 = 0.99`, `lambda2 = 0.9` — `rPPG_test.m` 21–22행에서 확정. fps 무관 고정 상수.
+
+---
+
+## 0. 폐기된 첫 구현과 확정 사양의 차이 (완료)
 
 사양 4번이 잘린 상태에서 작성했던 `StreamingPOS`는 논문 표준형(alpha-tuning + overlap-add)이라
-확정 사양과 **세 군데가 다르다.** 확정 사양대로 다시 쓴다.
+확정 사양과 **세 군데가 달랐다.** `POSProcessor`로 다시 썼다.
 
-| 항목 | 현재 코드 (버릴 것) | 확정 사양 (맞출 것) |
+| 항목 | 폐기한 코드 | 확정 사양 (현재) |
 |---|---|---|
 | 분산 | `E[S²] − E[S]²` | `Svar = λ₁·Svar + (1−λ₁)·(S−Smean)²` |
-| h | `h = S₁ + α·S₂`, `α = σ₁/σ₂` | `h = S₁/(σ₁+1e−9) + S₂/(σ₂+1e−9)` |
+| h | `h = S₁ + α·S₂`, `α = σ₁/σ₂` | `h = S₁/(σ₁+1e−9) + 1/(σ₂+1e−9)·S₂` |
 | 출력 | `out = h − EWMA(h)` (high-pass) | `rPPG(n) = rPPG(n−1) + (h − hmean)` (**누적합**) |
 | λ | 시간상수 하나 | `λ₁`(Cmean·Smean·Svar), `λ₂`(hmean) **두 개** |
 
 `h`는 `S₁+ (σ₁/σ₂)·S₂`를 `1/σ₁`로 스케일한 것과 방향은 같지만, **시변 이득 `1/σ₁`이 붙는다는 점**이
 다르다. 진폭 정규화 효과가 있고 초기 구간(σ가 0에 가까울 때) 거동도 달라지므로 사양대로 간다.
 
-재사용 가능한 것: `EWMA`, `FaceQuad`/`QuadSmoother`, `ROISampler`, `FaceTracker`, `CameraSession`,
-`CaptureCoordinator`의 이원화 골격, FFT/스펙트럼 추정기. 폐기: `StreamingPOS`, `WindowedPOS`,
-`EWStatistics`(사양의 Svar 형태로 교체), `PulsePipeline`의 band-pass 전제.
+재사용한 것: `EWMA`, `FaceQuad`/`QuadSmoother`, `ROISampler`, `FaceTracker`, `CameraSession`,
+`CaptureCoordinator`의 이원화 골격, FFT/스펙트럼 추정기.
+폐기한 것: `StreamingPOS`, `WindowedPOS`, `EWStatistics`, `EWMAHighPass`, `RGBSample`.
 
 ---
 
@@ -52,13 +69,21 @@ CSV의 `Cr,Cg,Cb` 열만 읽어 POS를 다시 돌려 출력 CSV를 만드는 오
 
 ### 1-3. MATLAB 레퍼런스 (`matlab/pos_reference.m`)
 
-주신 MATLAB 코드를 **한 줄도 바꾸지 않고** 옮긴 스크립트. 같은 CSV를 입력으로 받아 rPPG를 출력한다.
+`rPPG_test.m` 133–170행을 **산술을 한 글자도 바꾸지 않고** 떼어내 CSV 입출력만 붙인 스크립트.
 Swift 출력과 `max(abs(diff))`로 대조하는 것이 5단계의 통과 기준이다.
+절차는 `matlab/README.md` 참고.
 
-### 1-4. 디버그 화면
+### 1-4. 골든 픽스처 (`tools/gen_golden.py`)
 
-단계마다 확인할 것이 다르므로, 화면에서 어떤 신호를 볼지 고를 수 있게 한다:
-`C(R,G,B)` / `S₁,S₂` / `Sstd` / `h`, `hmean` / `rPPG` / `meanCornerY`. 실시간 파형 + 현재 수치.
+MATLAB이 없는 환경에서도 회귀가 잡히도록, 합성 `C` 수열과 그 POS 출력 전체를
+`Tests/RPPGCoreTests/Fixtures/`에 커밋해 둔다. `swift test`가 매번 이것과 대조한다.
+17자리(`%.17g`)로 기록하므로 CSV 왕복이 비트 단위로 무손실임을 확인했다.
+
+### 1-5. 디버그 화면
+
+`rPPG(H)` / `rPPG band-passed` / `Respiration` 파형을 골라 볼 수 있고,
+그 아래 `C`, `Cmean`, `C./Cmean`, `S`, `Smean`, `Sstd`, `h`, `hmean`, `rPPG`의
+**현재 수치를 매 프레임 표시**한다. Stage 5를 CSV 없이 화면에서도 볼 수 있게 하기 위한 것.
 
 > **통과 기준:** 60초 녹화 후 CSV가 나오고, 그 CSV를 리플레이 러너에 넣었을 때
 > `rPPG` 열이 기기에서 계산된 값과 **완전히 동일**(double 비트 일치)해야 한다.
@@ -143,15 +168,18 @@ Swift 출력과 `max(abs(diff))`로 대조하는 것이 5단계의 통과 기준
 ### Stage 4 — EWMA 유닛
 
 **만드는 것**
-- `EWMA(λ)` — `y = λy + (1−λ)x`, 첫 샘플로 초기화 (사양의 "초기값: C/S/h"와 일치)
-- 3×1 / 2×1 벡터용 래퍼 (`EWMAVector`)
-- `Svar` 전용 형태: `Svar = λ₁·Svar + (1−λ₁)·(S−Smean)²`, 초기값 `(S−Smean)²`
+- `EWMA(λ)` — `y = λy + (1−λ)x`, 첫 샘플로 초기화 (`isempty` 분기와 동일)
+- 3×1 / 2×1 값 타입 (`ChannelTriple`, `ProjectionPair`) — MATLAB의 `.*`/`./`/`.^` 의미 그대로
+- `Svar`는 별도 타입 없이 `POSProcessor` 안에서 사양 형태 그대로:
+  `Svar = λ₁·Svar + (1−λ₁)·(S−Smean)²`, 초기값 `(S−Smean)²`
 
-**검증 방법 (사용자)**
-- 유닛 테스트가 사양 점화식을 손계산과 1e−12 이내로 재현하는지 (`swift test` 출력)
-- 임의 수열을 MATLAB `filter`와 대조하는 테스트 케이스
+**검증 방법 (사용자)** — `swift test`
 
-**통과 기준:** 유닛 테스트 전부 통과, MATLAB 대조 `max|diff| < 1e−12`.
+- `testEWMARecurrenceMatchesSpecification` — 점화식을 **오차 0**으로 재현
+- `testOneMinusLambdaIsComputedNotLiteral` — `1−0.99 ≠ 0.01`임을 이용해,
+  `(1−λ)`를 리터럴로 쓰지 않았음을 고정
+
+**통과 기준:** 유닛 테스트 전부 통과.
 
 ---
 
@@ -166,7 +194,7 @@ S     = [0 1 -1; -2 1 1] * (C ./ Cmean)
 Smean = λ1*Smean + (1-λ1)*S            // 초기값 S
 Svar  = λ1*Svar  + (1-λ1)*(S-Smean).^2 // 초기값 (S-Smean).^2
 Sstd  = sqrt(Svar)
-h     = S[0]/(Sstd[0]+1e-9) + S[1]/(Sstd[1]+1e-9)
+h     = S[0]/(Sstd[0]+1e-9) + (1/(Sstd[1]+1e-9))*S[1]   // 레퍼런스의 비대칭 형태 그대로
 hmean = λ2*hmean + (1-λ2)*h            // 초기값 h
 rPPG += (h - hmean)
 ```
@@ -188,8 +216,8 @@ rPPG += (h - hmean)
 |---|---|
 | MATLAB vs Swift (동일 C 입력) | `max abs(rPPG_swift − rPPG_matlab) < 1e−9` |
 | 기기 vs 리플레이 | 비트 단위 일치 |
-| 합성 72 bpm 신호 | rPPG 스펙트럼 피크 72 ±1 bpm |
-| 초기 폭주 | 첫 300 프레임에서 \|h\| < 1e6 |
+| 합성 72 bpm 신호 | rPPG 스펙트럼 피크 72 ±1 bpm — **확인됨: 정확히 1.200 Hz** |
+| 초기 폭주 | 없음 — **확인됨: 40초 합성 데이터에서 max\|h\| = 20.2** |
 
 ---
 
@@ -244,18 +272,31 @@ Stage 4는 하드웨어가 필요 없으므로 Stage 1과 병행 가능하다.
 
 ---
 
-## 4. 시작 전에 결정이 필요한 것
+## 4. 해결된 결정 사항
 
-1. **λ₁, λ₂ 값.** 사양에 값이 없다. 제안 — 30 fps 기준 `λ₁ = 0.979`(τ≈1.6 s, 논문 윈도우 길이 상당),
-   `λ₂ = 0.967`(τ≈1 s). 프레임 레이트가 60 Hz면 같은 τ를 유지하도록 `λ = exp(−1/(τ·fps))`로 재계산할지,
-   아니면 fps와 무관하게 **고정 상수**로 둘지 결정 필요. (MATLAB 코드에서 쓰시던 값이 있으면 그 값이 정답)
-2. **원본 MATLAB 스크립트.** 갖고 계신 `.m` 파일을 주시면 그것을 그대로 레퍼런스로 쓰겠다.
-   대조 기준이 훨씬 단단해진다.
-3. **`Sstd`가 0에 가까운 초기 구간 처리.** 사양대로면 `h = S/(0+1e−9)`가 되어 이론상 1e9까지 튈 수 있다.
-   (a) 사양 그대로 두고 화면에만 warm-up 표시, (b) 초기 N 프레임 출력 억제 — 어느 쪽인지.
-4. **rPPG 누적합의 drift.** 사양의 `rPPG += (h−hmean)`은 저주파가 남아 서서히 흐른다.
-   저장/검증용 rPPG는 사양 그대로 두고, **화면 표시와 심박 추정에만** detrend를 적용하는 방향으로 잡았다.
-   맞는지 확인 필요.
-5. **프레임 드롭 시 동작.** 프레임이 빠졌을 때 (a) 그냥 다음 프레임으로 진행, (b) 이전 C를 채워 넣기.
-   EWMA가 시간 기반이 아니라 샘플 기반이므로 (a)면 실효 λ가 흔들린다. 기본은 (a) + 드롭률 감시로 제안.
-6. **얼굴 유실 시 POS 상태.** 초기화할지, 유지할지. 기본은 3초 이상 유실 시 전체 초기화로 제안.
+1. **λ₁ = 0.99, λ₂ = 0.9** — `rPPG_test.m` 21–22행. **fps 무관 고정 상수**로 확정.
+   λ를 fps에 맞춰 재계산하면 MATLAB 대조가 깨지므로 하지 않는다. 실효 메모리는
+   `EWMA.timeConstantInSamples`와 화면 진단에서 확인할 수 있다.
+2. **초기 `Sstd ≈ 0` 폭주는 일어나지 않는다.** 첫 스텝은 `C == Cmean`이라 `S = [0;0]`,
+   따라서 `h = 0/1e−9 = 0`이다. 이후에도 `Sstd`가 `|S|`에 비례해 자라므로 `h`는
+   대략 `1/sqrt(1−λ₁) ≈ 10` 규모에 머문다. 40초 합성 데이터에서 실측 `max|h| = 20.2`.
+   테스트 `testHStaysBoundedThroughTheWholeFixture`가 이를 고정한다. **별도 warm-up 억제 없음.**
+3. **rPPG 누적합의 drift** — 저장·검증용 `rppg`는 사양 그대로 손대지 않고,
+   화면 표시와 심박 추정 입력에만 band-pass 사본(`analysisWaveform`)을 쓴다.
+   두 신호가 CSV와 API에서 분리되어 있다.
+4. **프레임 드롭 시** — 그냥 다음 프레임으로 진행한다(C를 채워 넣지 않는다).
+   드롭률은 Stage 1 통과 기준(< 0.5 %)으로 감시하고 화면·CSV에 남긴다.
+5. **얼굴 유실 시** — 3초 이상 유실되면 POS 상태 전체를 초기화한다.
+6. **ROI 크기** — 사양의 "중앙 80 %"는 예시였고 레퍼런스는 회전된 박스 **전체**를 평균한다.
+   기본 0.8, UI 슬라이더로 조절, **MATLAB과 대조할 녹화는 1.00으로** 둔다.
+
+## 5. 레퍼런스와의 남은 차이 (Stage 2에서 다룰 것)
+
+`rPPG_test.m`의 트래킹은 `detectMinEigenFeatures` + KLT `vision.PointTracker`로 특징점을 추적하고,
+`estgeotform2d(..., 'similarity')`로 얻은 변환을 bbox 코너에 누적 적용한다. 그래서 코너가
+**서브픽셀로 매끄럽게** 움직이고, 그것이 호흡 신호의 품질을 좌우한다.
+
+현재 Swift 구현은 Vision의 얼굴 bbox + roll을 쓰는데, 이쪽이 더 거칠고 양자화되어 있다.
+Stage 2에서 레퍼런스에 맞춰 **얼굴 랜드마크 집합 사이의 similarity 변환을 최소자승으로 추정**하는
+방식으로 바꿀 것을 제안한다. iOS에 KLT는 없지만, 랜드마크 기반 similarity 피팅이 같은 역할을 하고
+누적 드리프트가 없다는 이점도 있다.

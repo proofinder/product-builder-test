@@ -7,7 +7,7 @@ import RPPGCore
 /// Step 2 of the spec: the ROI is the **central 80% of the detected face**, which is
 /// applied by the caller via `FaceQuad.scaled(0.8)`. This type turns that quad — which
 /// is rolled with the head, so it stays on skin when the subject tilts — into a single
-/// ``RGBSample``.
+/// ``ROISample``.
 ///
 /// The walk is over the quad's axis-aligned bounds with a stride, testing each
 /// candidate against the rolled quad. For a 300 px face at stride 2 that is roughly
@@ -22,25 +22,26 @@ struct ROISampler: Sendable {
     /// Channel value at or above which a pixel counts as clipped.
     var clippingThreshold: Double = 250
 
-    /// Optional YCbCr skin gate. Off by default because the spec defines the ROI
-    /// purely geometrically; switch it on when glasses, hair or a beard intrude on the
-    /// central 80%.
+    /// Optional YCbCr skin gate. Off by default: the reference averages every pixel of
+    /// the rotated box, and a gate would change `C` in a way MATLAB cannot reproduce.
+    /// Switch it on only for experiments, never for a run being cross-checked.
     var skinGateEnabled: Bool = false
 
     /// Averages the pixels of `roi` in a 32BGRA pixel buffer.
     ///
-    /// - Returns: an ``RGBSample``; `pixelCount == 0` means the ROI fell outside the
-    ///   frame, and the pipelines will treat the sample as unusable.
-    func sample(roi: FaceQuad, pixelBuffer: CVPixelBuffer, timestamp: TimeInterval) -> RGBSample {
+    /// - Returns: an ``ROISample`` carrying the specification's `C`; `pixelCount == 0`
+    ///   means the ROI fell outside the frame, and the pipelines treat the sample as
+    ///   unusable rather than advancing POS with garbage.
+    func sample(roi: FaceQuad, pixelBuffer: CVPixelBuffer, timestamp: TimeInterval) -> ROISample {
         guard CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA else {
-            return RGBSample(red: 0, green: 0, blue: 0, timestamp: timestamp, pixelCount: 0)
+            return .empty(timestamp: timestamp)
         }
 
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
 
         guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else {
-            return RGBSample(red: 0, green: 0, blue: 0, timestamp: timestamp, pixelCount: 0)
+            return .empty(timestamp: timestamp)
         }
 
         let width = CVPixelBufferGetWidth(pixelBuffer)
@@ -50,7 +51,7 @@ struct ROISampler: Sendable {
 
         let bounds = roi.bounds.clipped(toWidth: Double(width), height: Double(height))
         guard bounds.width > 0, bounds.height > 0 else {
-            return RGBSample(red: 0, green: 0, blue: 0, timestamp: timestamp, pixelCount: 0)
+            return .empty(timestamp: timestamp)
         }
 
         let step = Swift.max(1, pixelStride)
@@ -87,13 +88,13 @@ struct ROISampler: Sendable {
         }
 
         guard count > 0 else {
-            return RGBSample(red: 0, green: 0, blue: 0, timestamp: timestamp, pixelCount: 0)
+            return .empty(timestamp: timestamp)
         }
+        // C(1:3,1) = mean(mean(faceimg)) — a plain arithmetic mean over the ROI, on the
+        // same 0-255 scale MATLAB's uint8-to-double promotion produces.
         let n = Double(count)
-        return RGBSample(
-            red: sumR / n,
-            green: sumG / n,
-            blue: sumB / n,
+        return ROISample(
+            channels: ChannelTriple(red: sumR / n, green: sumG / n, blue: sumB / n),
             timestamp: timestamp,
             pixelCount: count,
             clippedFraction: Double(clipped) / n
