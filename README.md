@@ -4,8 +4,14 @@
 추적된 얼굴 코너의 수직 움직임에서 호흡 신호를 추출하는 iOS 앱입니다.
 
 **기준 구현은 `matlab/rPPG_test.m`입니다.** Swift는 여기에 맞추고, 반대가 아닙니다.
-개발은 단계별로 검증하며 진행합니다 — [`docs/PLAN.md`](docs/PLAN.md), 검증 절차는
-[`matlab/README.md`](matlab/README.md).
+개발은 단계별로 검증하며 진행합니다.
+
+| 문서 | 내용 |
+|---|---|
+| [`docs/IPAD.md`](docs/IPAD.md) | **아이패드에서 받아서 바로 실행하기** (Mac 불필요) |
+| [`docs/PLAN.md`](docs/PLAN.md) | 단계별 개발 계획과 통과 기준 |
+| [`docs/TRACKING.md`](docs/TRACKING.md) | 트래킹 방식 후보들을 재본 결과와 선택 근거 |
+| [`matlab/README.md`](matlab/README.md) | MATLAB 대조 검증 절차 |
 
 ---
 
@@ -75,6 +81,9 @@ App/RPPG/
   Views/SignalPanel.swift         Stage 3+ 화면 (POS 중간값, 심박·호흡)
   Views/FaceOverlayView.swift     얼굴 quad + 코너 번호 + roll 축 오버레이
 
+RPPG.swiftpm/                     아이패드용 App Playground (생성물)
+tools/make_swiftpm.py             위 폴더를 원본에서 생성
+
 matlab/rPPG_test.m                원본 레퍼런스 (수정 금지)
 matlab/pos_reference.m            133–170행만 CSV 입출력으로 감싼 것
 tools/gen_golden.py               합성 C + 골든 POS 출력 생성
@@ -102,6 +111,26 @@ iOS에 KLT는 없지만 Vision 랜드마크가 매 프레임 대응이 잡힌 �
 
 피팅은 유닛 테스트로 고정되어 있습니다 — 알려진 변환을 1e-10으로 복원, 이상치 배제,
 랜드마크 잡음을 코너 위치에서 **3배 이상 감소**(1.84 px → 0.57 px).
+
+### 랜드마크 개수가 유일한 실질적 지렛대
+
+피팅이 독립 잡음을 `√개수`로 줄이므로, 호흡 신호(mean corner y)의 노이즈 바닥은
+점 개수로 결정됩니다. 220×280 박스, 축당 1.5 px 잡음 기준 시뮬레이션:
+
+| 랜드마크 | mean corner y std |
+|---|---|
+| 20개 | 0.39 px |
+| 40개 | 0.27 px |
+| 76개 | **0.20 px** |
+
+호흡에 의한 머리 움직임이 태블릿 거리에서 0.5–2 px이므로 이 차이가 곧 SNR입니다.
+다만 늘어나는 점은 가장 덜 rigid한 것들(입·얼굴 외곽선)이라, 정지·무언 상태에선 유리하고
+말하거나 움직이면 불리합니다. **Tracking 패널의 `Landmarks` 선택기**(Rigid / ＋Mouth / All)로
+바꿔가며 corner jitter를 재서 고르면 됩니다.
+
+IRLS 강건 피팅과 "코너 대신 랜드마크 중심" 대안도 재봤지만 각각 이득 없음 / 1.15배에 그쳐
+채택하지 않았습니다. ARKit은 TrueDepth(iPad Pro) 제약 때문에 보류했습니다.
+근거는 [`docs/TRACKING.md`](docs/TRACKING.md).
 
 ### 앱에서 확인하는 법
 
@@ -151,7 +180,17 @@ EWMA(τ ≈ 0.25 s, 프레임 레이트)에 통과시켜 ROI가 연속적으로 
 
 ## 빌드 / 실행
 
-**요구사항:** Xcode 16 이상, iOS 16 이상 기기. 카메라가 필요하므로 **시뮬레이터에서는 측정이 안 됩니다.**
+카메라가 필요하므로 **시뮬레이터에서는 측정이 안 됩니다.**
+
+### 아이패드만으로 (Mac 불필요)
+
+Safari에서 저장소를 **Code ▸ Download ZIP** → 파일 앱에서 압축 해제 →
+**`RPPG.swiftpm`** 탭 → Swift Playgrounds에서 ▶︎.
+자세한 절차는 [`docs/IPAD.md`](docs/IPAD.md).
+
+### Mac + Xcode
+
+**요구사항:** Xcode 16 이상, iOS 16 이상 기기.
 
 ```bash
 open App/RPPG.xcodeproj      # 스킴 RPPG, 실기기 선택 후 실행

@@ -19,6 +19,9 @@
 
 `lambda1 = 0.99`, `lambda2 = 0.9` — `rPPG_test.m` 21–22행에서 확정. fps 무관 고정 상수.
 
+아이패드만으로 빌드·실행하려면 [`docs/IPAD.md`](IPAD.md).
+트래킹 방식 후보 검토 결과는 [`docs/TRACKING.md`](TRACKING.md).
+
 ---
 
 ## 0. 폐기된 첫 구현과 확정 사양의 차이 (완료)
